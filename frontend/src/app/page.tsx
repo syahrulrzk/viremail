@@ -176,6 +176,8 @@ interface ScanResult {
       bbot: {
         ran?: boolean;
         emails_found?: number;
+        emails_valid?: number;
+        emails_external?: number;
         subdomains_found?: number;
         message?: string;
       };
@@ -469,7 +471,14 @@ export default function Home() {
   const docStats: { docs_found?: number; docs_parsed?: number } =
     r?.doc_stats ?? {};
   const deepOsint: {
-    bbot?: { ran?: boolean; emails_found?: number; subdomains_found?: number; message?: string };
+    bbot?: {
+      ran?: boolean;
+      emails_found?: number;
+      emails_valid?: number;
+      emails_external?: number;
+      subdomains_found?: number;
+      message?: string;
+    };
     holehe?: { checked?: number; results?: Record<string, string[]>; message?: string };
   } | null = r?.deep_osint ?? null;
   const processing = result?.status === "processing";
@@ -1359,6 +1368,17 @@ export default function Home() {
                       <span className="text-muted-foreground">
                         {deepOsint.bbot.message ?? (deepOsint.bbot.ran ? "Done" : "Skipped")}
                       </span>
+                      {deepOsint.bbot.ran &&
+                        typeof deepOsint.bbot.emails_valid === "number" && (
+                          <span className="flex flex-wrap items-center gap-2">
+                            <span className="rounded-md border border-emerald-500/30 bg-emerald-500/10 px-2 py-0.5 text-xs font-medium text-emerald-400">
+                              {deepOsint.bbot.emails_valid} valid @domain
+                            </span>
+                            <span className="rounded-md border border-zinc-500/30 bg-zinc-500/10 px-2 py-0.5 text-xs font-medium text-zinc-400">
+                              {deepOsint.bbot.emails_external ?? 0} eksternal dibuang
+                            </span>
+                          </span>
+                        )}
                     </div>
                   )}
                   {deepOsint.holehe?.results &&

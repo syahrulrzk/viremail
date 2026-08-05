@@ -117,11 +117,9 @@ MAX_CRAWL_DEPTH = 2
 MAX_SITEMAP_URLS = 15
 MAX_SITEMAP_FETCHES = 25  # cap sitemap-index recursion (huge sites have hundreds)
 MAX_SEARCH_RESULT_PAGES = 4
-MAX_EMAILS = 60
 MAX_DOCS = 10
 MAX_DOC_BYTES = 3 * 1024 * 1024  # 3 MB
 MAX_SUBDOMAIN_CRAWLS = 5
-MAX_SMTP_CHECKS = 20
 MAX_PATTERN_CHECKS = 14
 SMTP_TIMEOUT = 6
 SMTP_BUDGET_SECONDS = 45
@@ -586,8 +584,7 @@ def crawl_site(domain: str, disallowed: list, sitemap_urls: list) -> tuple:
         ordered.append((prio, depth, url))
 
     idx = 0
-    while (idx < len(ordered) and pages_crawled < MAX_CRAWL_PAGES
-           and len(emails_by_source) < MAX_EMAILS):
+    while (idx < len(ordered) and pages_crawled < MAX_CRAWL_PAGES):
         prio, depth, url = ordered[idx]
         idx += 1
         key = url.rstrip("/")
@@ -668,8 +665,6 @@ def extract_emails_from_docs(doc_urls: list, domain: str) -> tuple:
     email_urls: dict = {}
     parsed = 0
     for url in doc_urls:
-        if len(emails) >= MAX_EMAILS:
-            break
         text = _document_text(url)
         if not text:
             continue
@@ -771,8 +766,6 @@ def ocr_emails(img_urls: list, doc_urls: list, domain: str) -> tuple:
 
     # 1) images
     for url in img_urls[:MAX_OCR_IMAGES]:
-        if len(emails) >= MAX_EMAILS:
-            break
         content = _download_bytes(url)
         if not content:
             continue
@@ -789,8 +782,6 @@ def ocr_emails(img_urls: list, doc_urls: list, domain: str) -> tuple:
     # 2) scanned PDFs — only those whose embedded text layer is (nearly) empty
     pdf_urls = [u for u in doc_urls if os.path.splitext(urlparse(u).path)[1].lower() == ".pdf"]
     for url in pdf_urls[:MAX_OCR_PDF_PAGES]:
-        if len(emails) >= MAX_EMAILS:
-            break
         text = _document_text(url)
         if text and len(text.strip()) >= 40:  # real text layer → not scanned
             continue
@@ -1064,7 +1055,7 @@ def search_wayback(domain: str, deadline: float | None = None) -> tuple:
     for row in rows[1:]:
         if len(row) < 2:
             continue
-        if stats["pages_fetched"] >= MAX_WAYBACK_PAGES or len(emails) >= MAX_EMAILS:
+        if stats["pages_fetched"] >= MAX_WAYBACK_PAGES:
             break
         if deadline is not None and time.monotonic() > deadline:
             break
@@ -1290,7 +1281,7 @@ def _smtp_probe(mx_host: str, email: str, from_addr: str, timeout: int) -> str:
 
 
 def verify_emails_smtp(emails: list, mx_hosts: list, domain: str, *,
-                       max_checks: int = MAX_SMTP_CHECKS,
+                       max_checks: int | None = None,
                        working_host: str | None = None,
                        deadline: float | None = None) -> tuple:
     """Verify emails against the domain's mail server (RCPT TO probe).
@@ -1368,7 +1359,8 @@ def verify_emails_smtp(emails: list, mx_hosts: list, domain: str, *,
 
     status_map: dict = {}
     for email in emails:
-        if len(status_map) >= max_checks or time.monotonic() > deadline:
+        if (max_checks is not None and len(status_map) >= max_checks) \
+                or time.monotonic() > deadline:
             break
         status_map[email] = _smtp_probe(working_host, email, from_addr, SMTP_TIMEOUT)
     for email in emails:
@@ -1639,6 +1631,12 @@ def process_domain_search(domain: str, scan_id: int, deep: bool = False,
         else:
             deep_osint["bbot"]["message"] = "Scan budget exhausted — BBOT skipped."
 
+    # Raw-vs-valid split for the UI: BBOT's raw count includes addresses from
+    # other domains; only valid @target-domain addresses reach the report.
+    bbot_valid = sum(1 for e in bbot_emails if is_valid_target_email(e, domain))
+    deep_osint["bbot"]["emails_valid"] = bbot_valid
+    deep_osint["bbot"]["emails_external"] = max(len(bbot_emails) - bbot_valid, 0)
+
     # 7) Merge observed emails (website/mailto/security.txt/docs/subdomain/whois/search)
     observed_map: dict = {}
     for email, source in crawled_emails.items():
@@ -1669,7 +1667,7 @@ def process_domain_search(domain: str, scan_id: int, deep: bool = False,
         if is_valid_target_email(email, domain):
             observed_map.setdefault(email, "search")
     # No per-source cap for BBOT — every valid, non-duplicate BBOT email is
-    # added (the overall MAX_EMAILS cap on the final list still applies).
+    # added. No overall email cap either: ALL discovered emails are included.
     for email in sorted(bbot_emails):
         if is_valid_target_email(email, domain) and email not in observed_map:
             observed_map[email] = "bbot"
@@ -1700,7 +1698,7 @@ def process_domain_search(domain: str, scan_id: int, deep: bool = False,
          "url": email_urls.get(e, "")}
         for e, src in sorted(observed_map.items(),
                              key=lambda kv: (SOURCE_PRIORITY.get(kv[1], 9), kv[0]))
-    ][:MAX_EMAILS]
+    ]
 
     # 8) SMTP verification (RCPT TO probe — no mail is ever sent)
     mx_hosts = []
@@ -1797,7 +1795,6 @@ def process_domain_search(domain: str, scan_id: int, deep: bool = False,
     people_list = [people_map[k] for k in sorted(people_map)][:MAX_PEOPLE]
 
     observed = len(observed_map)
-    observed = min(observed, MAX_EMAILS)
 
     # 10) Confidence score
     score = 30
