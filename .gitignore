@@ -1,0 +1,39 @@
+# ---- Environment & secrets (never commit real .env files!) ----
+.env
+.env.*
+!.env.example
+
+# ---- Python / backend ----
+__pycache__/
+*.py[cod]
+backend/venv/
+venv/
+.venv/
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# ---- Node / Next.js (frontend has its own .gitignore too) ----
+node_modules/
+.next/
+out/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# ---- Runtime ----
+.pids
+*.pid
+
+# ---- Logs ----
+*.log
+
+# ---- OS / editors ----
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# ---- Misc build artifacts ----
+*.tsbuildinfo
