@@ -103,7 +103,6 @@ SOURCE_KEYS = [
 ]
 DEFAULT_SOURCES = list(SOURCE_KEYS)
 
-MAX_BBOT_EMAILS = 15
 DNS_RECORD_TYPES = ["A", "AAAA", "MX", "NS", "TXT"]
 
 MAX_GITHUB_COMMITS = 50
@@ -1669,13 +1668,11 @@ def process_domain_search(domain: str, scan_id: int, deep: bool = False,
     for email in ddg["emails"] + bing["emails"]:
         if is_valid_target_email(email, domain):
             observed_map.setdefault(email, "search")
-    bbot_added = 0
+    # No per-source cap for BBOT — every valid, non-duplicate BBOT email is
+    # added (the overall MAX_EMAILS cap on the final list still applies).
     for email in sorted(bbot_emails):
-        if bbot_added >= MAX_BBOT_EMAILS:
-            break
         if is_valid_target_email(email, domain) and email not in observed_map:
             observed_map[email] = "bbot"
-            bbot_added += 1
 
     # Track the public URL where each observed email was found (redirect icon).
     email_urls: dict = {}
