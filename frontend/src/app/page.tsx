@@ -32,6 +32,8 @@ import {
   Zap,
   Crosshair,
   ExternalLink,
+  FileSpreadsheet,
+  FileDown,
   type LucideIcon,
 } from "lucide-react";
 import Image from "next/image";
@@ -113,6 +115,9 @@ interface ScanResult {
   task_id?: string;
   message?: string;
   error?: string;
+  from_cache?: boolean;
+  cached_at?: string;
+  cached_hits?: number;
   results?: {
     emails: EmailResult[];
     email_stats: {
@@ -200,6 +205,18 @@ interface RecentSearch {
   time: number;
 }
 
+// Human-readable age for the VIRE Atlas cache badge, e.g. "3h ago".
+function cacheAge(cachedAt?: string): string {
+  if (!cachedAt) return "cached";
+  const t = new Date(cachedAt).getTime();
+  if (isNaN(t)) return "cached";
+  const mins = Math.max(1, Math.round((Date.now() - t) / 60000));
+  if (mins < 60) return `${mins}m ago`;
+  const hrs = Math.round(mins / 60);
+  if (hrs < 24) return `${hrs}h ago`;
+  return `${Math.round(hrs / 24)}d ago`;
+}
+
 // Google dork queries — Google blocks automated scraping, so these are meant
 // to be run manually by the user in their own browser.
 function buildDorks(domain: string): { label: string; q: string }[] {
@@ -223,6 +240,9 @@ export default function Home() {
   const [openDns, setOpenDns] = useState(true);
   const [openEmails, setOpenEmails] = useState(true);
   const [modeOpen, setModeOpen] = useState(false);
+  const [typewriterText, setTypewriterText] = useState("");
+  const [showCursor, setShowCursor] = useState(true);
+  const [exporting, setExporting] = useState<"excel" | "pdf" | null>(null);
   const resultsRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLInputElement>(null);
   const modeRef = useRef<HTMLDivElement>(null);
@@ -236,6 +256,30 @@ export default function Home() {
       } catch {}
     }, 0);
     return () => clearTimeout(t);
+  }, []);
+
+  // JavaScript-based typewriter effect
+  useEffect(() => {
+    const targetText = "domain";
+    let index = 0;
+
+    const typeNext = () => {
+      if (index < targetText.length) {
+        setTypewriterText(targetText.slice(0, index + 1));
+        index++;
+        setTimeout(typeNext, 150);
+      } else {
+        // Hide cursor after typing completes
+        setTimeout(() => setShowCursor(false), 500);
+      }
+    };
+
+    const t = setTimeout(typeNext, 500);
+    return () => {
+      clearTimeout(t);
+      setShowCursor(true);
+      setTypewriterText("");
+    };
   }, []);
 
   useEffect(() => {
@@ -281,7 +325,7 @@ export default function Home() {
     } catch {}
   };
 
-  const handleSearch = async (domain?: string) => {
+  const handleSearch = async (domain?: string, force = false) => {
     const value = (domain ?? query).trim().toLowerCase();
     if (!value) return;
 
@@ -308,7 +352,7 @@ export default function Home() {
       const res = await fetch(`${API_BASE}/search/domain`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ domain: cleaned, deep }),
+        body: JSON.stringify({ domain: cleaned, deep, force }),
       });
       const data = await res.json();
       if (!res.ok) {
@@ -345,6 +389,24 @@ export default function Home() {
   const copyAll = async () => {
     const emails = (result?.results?.emails ?? []).map((e: EmailResult) => e.email);
     if (emails.length) await copyText(emails.join("\n"), "all");
+  };
+
+  const handleExport = async (kind: "excel" | "pdf") => {
+    if (!result || exporting) return;
+    setExporting(kind);
+    // Let the spinner paint before the (synchronous) file generation kicks in.
+    await new Promise((res) => setTimeout(res, 30));
+    try {
+      // Dynamic import keeps the heavy export libs out of the initial bundle.
+      const mod = await import("@/lib/export");
+      if (kind === "excel") mod.exportToExcel(result);
+      else mod.exportToPdf(result);
+    } catch (err) {
+      console.error(`Export ${kind} failed`, err);
+      setError(`Failed to export ${kind === "excel" ? "Excel" : "PDF"}. Please try again.`);
+    } finally {
+      setExporting(null);
+    }
   };
 
   const r = result?.results;
@@ -459,21 +521,26 @@ export default function Home() {
 
           {/* tagline — flush against the logo */}
           <div
-            className="animate-fade-up flex items-center justify-center gap-3 mb-7 px-2"
+            className="animate-fade-up flex items-center justify-center gap-2 sm:gap-3 mb-6 sm:mb-7 px-2"
             style={{ animationDelay: "100ms" }}
           >
             <span className="hidden sm:block h-px w-10 sm:w-14 bg-gradient-to-r from-transparent to-primary/40" />
-            <span className="text-[11px] sm:text-xs font-semibold uppercase tracking-[0.25em] text-muted-foreground">
+            <span className="text-[10px] sm:text-[11px] font-semibold uppercase tracking-[0.2em] sm:tracking-[0.25em] text-muted-foreground text-center">
               Verified Intelligence <span className="text-primary">&</span> Recon Engine
             </span>
             <span className="hidden sm:block h-px w-10 sm:w-14 bg-gradient-to-l from-transparent to-primary/40" />
           </div>
 
-          <h1 className="animate-fade-up text-3xl sm:text-4xl md:text-5xl font-bold tracking-tight mb-4">
-            Discover public emails from any domain.
+          <h1 className="animate-fade-up text-2xl sm:text-3xl md:text-4xl lg:text-5xl font-bold tracking-tight mb-4 text-center leading-tight">
+            <span>Discover public emails from any</span>
+            <span className="gradient-text ml-1">
+              {typewriterText}
+              {showCursor && <span className="animate-pulse">|</span>}
+            </span>
+            <span>.</span>
           </h1>
           <p
-            className="animate-fade-up text-sm sm:text-base text-muted-foreground max-w-2xl mx-auto leading-relaxed mb-8 px-1"
+            className="animate-fade-up text-xs sm:text-sm md:text-base text-muted-foreground max-w-2xl mx-auto leading-relaxed mb-8 px-1"
             style={{ animationDelay: "80ms" }}
           >
             Enter a domain to discover publicly available email addresses using
@@ -483,11 +550,11 @@ export default function Home() {
 
           {/* ================= SCAN CONSOLE ================= */}
           <div
-            className="animate-fade-up max-w-3xl mx-auto"
+            className="animate-fade-up w-full max-w-3xl mx-auto px-2 sm:px-0"
             style={{ animationDelay: "240ms" }}
           >
             <div
-              className={`group relative rounded-2xl border bg-card/70 backdrop-blur-xl shadow-2xl shadow-black/40 transition-all duration-300 focus-within:border-primary/60 focus-within:ring-4 focus-within:ring-primary/10 ${
+              className={`group relative rounded-2xl border bg-card/70 backdrop-blur-xl shadow-2xl shadow-black/40 transition-all duration-300 focus-within:border-primary/60 focus-within:ring-4 focus-within:ring-primary/10 animate-scale-in ${
                 deep
                   ? "border-fuchsia-500/50 shadow-fuchsia-500/15"
                   : "border-border/70 hover:border-primary/40"
@@ -514,7 +581,7 @@ export default function Home() {
                 <Button
                   onClick={() => handleSearch()}
                   disabled={loading || !query.trim()}
-                  className="w-full sm:w-auto justify-center px-5 md:px-7 py-3 sm:py-3.5 h-auto rounded-xl text-base font-semibold bg-gradient-to-r from-primary to-fuchsia-500 hover:from-primary/90 hover:to-fuchsia-500/90 shadow-lg shadow-primary/25 disabled:opacity-40"
+                  className="w-full sm:w-auto justify-center px-5 md:px-7 py-3 sm:py-3.5 h-auto rounded-xl text-base font-semibold bg-gradient-to-r from-primary to-fuchsia-500 hover:from-primary/90 hover:to-fuchsia-500/90 shadow-lg shadow-primary/25 disabled:opacity-40 animate-pulse-glow"
                 >
                   {loading ? (
                     <span className="flex items-center gap-2">
@@ -757,6 +824,18 @@ export default function Home() {
                         <CheckCircle className="w-3.5 h-3.5" /> Scan complete
                       </span>
                     )}
+                    {result.from_cache && (
+                      <span
+                        className="flex items-center gap-1 text-xs text-sky-300 bg-sky-500/10 border border-sky-500/40 rounded-full px-3 py-1"
+                        title={`Served from VIRE Atlas (cached ${result.cached_at ? new Date(result.cached_at).toLocaleString() : ""})`}
+                      >
+                        <Database className="w-3.5 h-3.5" />
+                        VIRE Atlas · {cacheAge(result.cached_at)}
+                        {typeof result.cached_hits === "number" && result.cached_hits > 1 && (
+                          <span className="opacity-70">· {result.cached_hits}× served</span>
+                        )}
+                      </span>
+                    )}
                   </div>
                   <div className="mt-3 flex flex-wrap items-center gap-x-5 gap-y-2 text-sm text-muted-foreground">
                     <span className="flex items-center gap-1.5">
@@ -859,6 +938,65 @@ export default function Home() {
                 </div>
               </div>
             </div>
+
+            {/* export toolbar */}
+            {result.status === "completed" && (
+            <div className="animate-fade-up rounded-2xl border border-border/70 bg-card/60 backdrop-blur-xl overflow-hidden">
+              <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 px-6 py-5">
+                <div className="flex items-center gap-3">
+                  <div className="w-9 h-9 rounded-lg bg-emerald-500/10 flex items-center justify-center">
+                    <FileDown className="w-5 h-5 text-emerald-400" />
+                  </div>
+                  <div className="text-left">
+                    <h3 className="font-semibold text-lg leading-tight">Export Report</h3>
+                    <p className="text-xs text-muted-foreground">
+                      Download the full scan log as Excel or a printable PDF report
+                    </p>
+                  </div>
+                </div>
+                <div className="flex flex-col sm:flex-row items-stretch sm:items-center gap-2.5">
+                  <Button
+                    variant="outline"
+                    size="lg"
+                    disabled={exporting !== null}
+                    onClick={() => handleExport("excel")}
+                    className="justify-center rounded-xl border-emerald-500/40 bg-emerald-500/10 text-emerald-300 hover:bg-emerald-500/20 hover:border-emerald-400/60 hover:text-emerald-200 transition-all"
+                  >
+                    {exporting === "excel" ? (
+                      <Activity className="w-4 h-4 animate-spin" />
+                    ) : (
+                      <FileSpreadsheet className="w-4 h-4" />
+                    )}
+                    Export Excel (.xlsx)
+                  </Button>
+                  <Button
+                    variant="outline"
+                    size="lg"
+                    disabled={exporting !== null}
+                    onClick={() => handleExport("pdf")}
+                    className="justify-center rounded-xl border-red-500/40 bg-red-500/10 text-red-300 hover:bg-red-500/20 hover:border-red-400/60 hover:text-red-200 transition-all"
+                  >
+                    {exporting === "pdf" ? (
+                      <Activity className="w-4 h-4 animate-spin" />
+                    ) : (
+                      <FileText className="w-4 h-4" />
+                    )}
+                    Export PDF Report
+                  </Button>
+                </div>
+              </div>
+              <div className="px-6 pb-4 text-[11px] text-muted-foreground/70 flex flex-wrap items-center gap-x-4 gap-y-1">
+                <span className="flex items-center gap-1.5">
+                  <FileSpreadsheet className="w-3.5 h-3.5 text-emerald-400" />
+                  Excel: Summary · Emails · People · DNS · Subdomains · WHOIS · Holehe
+                </span>
+                <span className="flex items-center gap-1.5">
+                  <FileText className="w-3.5 h-3.5 text-red-400" />
+                  PDF: formatted A4 report, ready to share
+                </span>
+              </div>
+            </div>
+            )}
 
             {/* emails section */}
             <section className="animate-fade-up rounded-2xl border border-border/70 bg-card/60 backdrop-blur-xl overflow-hidden">
@@ -1411,15 +1549,22 @@ export default function Home() {
             )}
 
             {/* rescan */}
-            <div className="flex justify-center pt-2">
+            <div className="flex flex-col sm:flex-row items-center justify-center gap-3 pt-2">
               <Button
                 variant="outline"
                 size="lg"
-                onClick={() => handleSearch(result.domain)}
+                onClick={() => handleSearch(result.domain, true)}
                 className="rounded-xl"
               >
-                <RefreshCw className="w-4 h-4" /> Rescan this domain
+                <RefreshCw className="w-4 h-4" />
+                {result.from_cache ? "Rescan (fresh data)" : "Rescan this domain"}
               </Button>
+              {result.from_cache && (
+                <span className="text-[11px] text-muted-foreground/70 flex items-center gap-1.5">
+                  <Database className="w-3.5 h-3.5 text-sky-400" />
+                  Data from VIRE Atlas — rescan to refresh
+                </span>
+              )}
             </div>
           </div>
         )}
