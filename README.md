@@ -263,7 +263,7 @@ All backend settings live in `.env` (see [`example.env`](example.env)):
 | `REDIS_HOST` / `REDIS_PORT` | `localhost` / `6379`           | Redis (Celery broker)                    |
 | `SECRET_KEY`               | dev default (change!)          | JWT secret for future auth               |
 | `GITHUB_TOKEN`             | —                              | Optional: raise GitHub commit-search rate limits |
-| `SMTP_VERIFY_ENABLED`      | `true`                         | Toggle SMTP RCPT-TO verification         |
+| `SMTP_VERIFY_ENABLED`      | `false` (default off)          | SMTP RCPT-TO active-mailbox check — off by default: the tool collects emails *found on the internet* as references, so inactive addresses are still useful. Enable only when you need active-mailbox filtering (slower scans) |
 | `OCR_ENABLED`              | `true`                         | Toggle local Tesseract OCR               |
 | `DEEP_TOOLS_ENABLED`       | `true`                         | Toggle BBOT + Holehe (deep mode)         |
 | `PORTAL_SCRAPING_ENABLED`  | `true`                         | Toggle job-portal HRD scraping           |

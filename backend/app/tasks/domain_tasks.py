@@ -1960,7 +1960,7 @@ def process_domain_search(self, domain: str, scan_id: int, mode: str = "smart",
     if ("jobportal" in enabled and settings.PORTAL_SCRAPING_ENABLED
             and _remaining() > 30):
         portal_deadline = time.monotonic() + min(
-            settings.PORTAL_DOMAIN_MAX_PAGES * 3.0, max(_remaining() - 10, 10))
+            settings.PORTAL_DOMAIN_MAX_PAGES * 6.0, max(_remaining() - 10, 10))
         portal_emails, portal_stats, portal_email_urls = (
             portals_mod.scrape_hrd_for_domain(
                 domain, deadline=portal_deadline,

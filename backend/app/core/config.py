@@ -39,8 +39,11 @@ class Settings(BaseSettings):
         "http://172.16.19.235:3001",
     ]
 
-    # SMTP verification (RCPT TO probe — no mail is ever sent)
-    SMTP_VERIFY_ENABLED: bool = True
+    # SMTP verification (RCPT TO probe — no mail is ever sent).
+    # Default OFF: this app collects emails *found on the internet* as
+    # references — even inactive addresses are useful. Turn on only when
+    # you actually need active-mailbox filtering (slower scans).
+    SMTP_VERIFY_ENABLED: bool = False
 
     # Local OCR (Tesseract) for images & scanned PDFs found during crawl
     OCR_ENABLED: bool = True

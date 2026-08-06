@@ -24,7 +24,7 @@ import threading
 import time
 import xml.etree.ElementTree as ET
 from collections import defaultdict
-from urllib.parse import urljoin, urlparse, parse_qs
+from urllib.parse import urlencode, urljoin, urlparse, parse_qs
 
 import requests
 from bs4 import BeautifulSoup
@@ -192,7 +192,7 @@ class _Robots:
         for scheme in ("https", "http"):
             try:
                 resp = requests.get(f"{scheme}://{host}/robots.txt",
-                                    headers=_headers(), timeout=6)
+                                    headers=_headers(), timeout=4)
             except Exception:
                 continue
             if resp.status_code != 200:
@@ -275,6 +275,7 @@ def polite_get(url: str, limiter: PoliteLimiter | None = None,
 # from direct fetching (aggressive anti-bot / login walls).
 PORTAL_SITE_DOMAINS = [
     "jobstreet.co.id",
+    "id.jobstreet.com",   # JobStreet Indonesia actually serves from this host
     "id.indeed.com",
     "glints.com",
     "kalibrr.com",
@@ -318,11 +319,11 @@ def _company_name(resp: requests.Response, soup: BeautifulSoup) -> str:
 # Search-engine discovery (DDG HTML + Bing RSS — no API keys)
 # ---------------------------------------------------------------------------
 
-def search_urls_ddg(query: str, limit: int = 6) -> list:
+def search_urls_ddg(query: str, limit: int = 6, timeout: int = 5) -> list:
     urls = []
     try:
         resp = requests.post("https://html.duckduckgo.com/html/",
-                             data={"q": query}, headers=_headers(), timeout=10)
+                             data={"q": query}, headers=_headers(), timeout=timeout)
         if resp.status_code == 200 and "anomaly" not in resp.text.lower():
             soup = BeautifulSoup(resp.text, "html.parser")
             for a in soup.select("a.result__a")[:limit]:
@@ -340,12 +341,12 @@ def search_urls_ddg(query: str, limit: int = 6) -> list:
     return urls
 
 
-def search_urls_bing(query: str, limit: int = 6) -> list:
+def search_urls_bing(query: str, limit: int = 6, timeout: int = 5) -> list:
     urls = []
     try:
         resp = requests.get("https://www.bing.com/search",
                             params={"q": query, "format": "rss"},
-                            headers=_headers(), timeout=10)
+                            headers=_headers(), timeout=timeout)
         if resp.status_code == 200:
             root = ET.fromstring(resp.text)
             for item in root.iter("item"):
@@ -357,37 +358,162 @@ def search_urls_bing(query: str, limit: int = 6) -> list:
     return urls
 
 
-def discover_listing_urls(keyword: str, location: str = "",
-                          max_urls: int = 30) -> list:
-    """`site:` dorks across portals -> deduped listing URLs.
+# Direct search-page URLs per portal (fallback when search engines block
+# us). Each is a plain GET of the portal's own job search page — fetched at
+# most once per portal per scan, through the polite limiter, so it stays far
+# below anything that could look like hammering.
+PORTAL_SEARCH_ENDPOINTS = [
+    # (portal host, search url, query param)
+    ("loker.id", "https://www.loker.id/cari-lowongan-kerja", "q"),
+    ("jobstreet.co.id", "https://id.jobstreet.com/id/jobs", "keywords"),
+    ("karir.com", "https://www.karir.com/lowongan-kerja", "q"),
+    ("kalibrr.com", "https://www.kalibrr.com/id_ID/job-board", "search"),
+    ("topkarir.com", "https://www.topkarir.com/lowongan-kerja", "search"),
+]
 
-    Queries stay small and are spread with human-like pauses; this is the
-    polite way to find listings without touching portal search APIs.
+
+def _job_detail_patterns(host: str) -> list:
+    """Path fragments that mark a job-detail page on a given portal."""
+    host = (host or "").lower()
+    if "jobstreet" in host:
+        return ["/id/job/", "/id/companies/"]
+    if "loker" in host:
+        return ["/lowongan-kerja/", "/loker/"]
+    if "kalibrr" in host:
+        return ["/job/", "/id_ID/job/"]
+    if "glints" in host:
+        return ["/id/lowongan/"]
+    if "karir" in host or "topkarir" in host:
+        return ["/lowongan/", "/job/", "/pekerjaan/"]
+    return ["/lowongan", "/job/", "/pekerjaan/"]
+
+
+def extract_job_detail_urls(soup, base_url: str, limit: int = 12) -> list:
+    """Pull job-detail URLs out of a listing page.
+
+    Only links whose path matches a known job-detail pattern for the portal
+    host are kept (nav links, login links, etc. are ignored). Relative links
+    are resolved against the listing page URL.
+    """
+    host = (urlparse(base_url).hostname or "").lower()
+    patterns = _job_detail_patterns(host)
+    urls: list = []
+    seen: set = set()
+    for a in soup.find_all("a", href=True):
+        href = a["href"].strip()
+        if not href or href.startswith(("#", "javascript:", "mailto:")):
+            continue
+        low = href.lower()
+        if not any(p in low for p in patterns):
+            continue
+        full = urljoin(base_url, href)
+        # strip tracking query strings (?ref=..., &origin=...) so the same job
+        # appearing 3x with different params counts once against the limit
+        key = full.split("?")[0]
+        if key in seen:
+            continue
+        seen.add(key)
+        urls.append(full)
+        if len(urls) >= limit:
+            break
+    return urls
+
+
+def discover_listing_urls(keyword: str, location: str = "",
+                          max_urls: int = 30,
+                          limiter: PoliteLimiter | None = None,
+                          deadline: float | None = None) -> list:
+    """Discover job-listing URLs — search-engine `site:` dorks first, then a
+    direct, polite fetch of each portal's own search page as fallback.
+
+    Search engines (DDG/Bing) often block datacenter IPs or drop the `site:`
+    operator, so the direct portal fallback keeps discovery working. Every
+    URL kept is validated against the known portal list — no junk hosts.
     """
     urls: list = []
     seen: set = set()
     keyword = (keyword or "").strip()
     if not keyword:
         return urls
-    for portal in PORTAL_SITE_DOMAINS:
-        if len(urls) >= max_urls:
-            break
-        queries = [f'site:{portal} "{keyword}"']
-        if location:
-            queries.append(f'site:{portal} "{keyword}" "{location}"')
-        queries.append(f'site:{portal} "{keyword}" (hrd OR hr OR lowongan OR recruitment)')
-        for q in queries:
-            if len(urls) >= max_urls:
-                break
-            for engine in (search_urls_ddg, search_urls_bing):
-                for u in engine(q, limit=6):
-                    if u not in seen and _portal_of(u):
-                        seen.add(u)
-                        urls.append(u)
-                    if len(urls) >= max_urls:
+
+    def _add(u: str) -> bool:
+        u = u.split("?")[0]
+        if u in seen or _portal_of(u) not in PORTAL_SITE_DOMAINS:
+            return False
+        seen.add(u)
+        urls.append(u)
+        return True
+
+    def _expired() -> bool:
+        return deadline is not None and time.monotonic() > deadline
+
+    # 1) search engines (best-effort; often rate-limited from servers).
+    #    One cheap probe query tells us if the engines work at all — when
+    #    they're blocking us, the full dork loop is skipped entirely so we
+    #    don't burn the polite window on dead engines.
+    probe = f'site:{PORTAL_SITE_DOMAINS[0]} "{keyword}"'
+    engines_alive = False
+    if not _expired():
+        for engine in (search_urls_ddg, search_urls_bing):
+            try:
+                for u in engine(probe, limit=3):
+                    if _portal_of(u) in PORTAL_SITE_DOMAINS:
+                        engines_alive = True
                         break
-                time.sleep(random.uniform(0.6, 1.4))  # human-like pause
-        time.sleep(random.uniform(0.8, 1.8))  # pause between portals
+            except Exception:
+                pass
+            if engines_alive:
+                break
+            time.sleep(random.uniform(0.4, 0.9))
+
+    if engines_alive:
+        for portal in PORTAL_SITE_DOMAINS[:4]:
+            if len(urls) >= max_urls or _expired():
+                break
+            queries = [f'site:{portal} "{keyword}"']
+            if location:
+                queries.append(f'site:{portal} "{keyword}" "{location}"')
+            queries.append(f'site:{portal} "{keyword}" (hrd OR hr OR lowongan OR recruitment)')
+            for q in queries:
+                if len(urls) >= max_urls or _expired():
+                    break
+                for engine in (search_urls_ddg, search_urls_bing):
+                    if _expired():
+                        break
+                    for u in engine(q, limit=6):
+                        _add(u)
+                        if len(urls) >= max_urls:
+                            break
+                    time.sleep(random.uniform(0.6, 1.4))  # human-like pause
+            time.sleep(random.uniform(0.8, 1.8))  # pause between portals
+
+    # 2) direct portal search pages (fallback, 1 request per portal).
+    #    Portals proven to be reachable & server-rendered are tried first;
+    #    the whole loop is bounded so a single slow portal can't stall a scan.
+    fallback_start = time.monotonic()
+    # order: known-good first, then the rest
+    ordered = sorted(PORTAL_SEARCH_ENDPOINTS,
+                     key=lambda e: 0 if e[0] in ("loker.id", "jobstreet.co.id") else 1)
+    for portal, base, qp in ordered:
+        if len(urls) >= max_urls or _expired():
+            break
+        if time.monotonic() - fallback_start > 25:
+            break  # hard ceiling on the whole fallback phase
+        try:
+            q = f"{keyword} {location}".strip()  # location folded into the query
+            url = base + "?" + urlencode({qp: q})
+            resp = polite_get(url, limiter=limiter, timeout=10)
+            if resp is None or resp.status_code != 200:
+                continue
+            soup = BeautifulSoup(resp.text, "html.parser")
+            # the search page itself can carry emails; detail links get added
+            for detail in extract_job_detail_urls(soup, url, limit=6):
+                if _add(detail) and len(urls) >= max_urls:
+                    break
+        except Exception:
+            continue
+        time.sleep(random.uniform(0.6, 1.2))
+
     return urls[:max_urls]
 
 
@@ -399,7 +525,7 @@ def _harvest_page(url: str, limiter: PoliteLimiter, resp=None):
     """Fetch one listing page politely; returns (emails, company, soup)."""
     resp = resp or polite_get(url, limiter=limiter, timeout=10)
     if not resp or resp.status_code != 200:
-        return set(), "", None
+        return None, "", None  # fetch failed -> caller skips this page
     soup = BeautifulSoup(resp.text, "html.parser")
     found = extract_emails(resp.text) | extract_mailto_emails(soup)
     return {e for e in found if _is_usable_email(e)}, _company_name(resp, soup), soup
@@ -426,7 +552,8 @@ def scrape_hrd_bulk(keyword: str, location: str = "", max_pages: int = 20,
         jitter=settings.PORTAL_JITTER,
         host_cap=settings.PORTAL_HOST_CAP,
     )
-    urls = discover_listing_urls(keyword, location, max_urls=max_pages * 2)
+    urls = discover_listing_urls(keyword, location, max_urls=max_pages * 2,
+                                 limiter=limiter, deadline=deadline)
     stats["listings_found"] = len(urls)
 
     results: list = []
@@ -440,9 +567,11 @@ def scrape_hrd_bulk(keyword: str, location: str = "", max_pages: int = 20,
         if _portal_of(url) in SKIP_FETCH_DOMAINS:
             continue
         emails, company, _ = _harvest_page(url, limiter)
+        if emails is None:
+            continue  # fetch failed
+        fetched += 1  # a page we actually managed to fetch
         if not emails:
             continue
-        fetched += 1
         for e in sorted(emails):
             if e in seen:
                 continue
@@ -488,7 +617,8 @@ def scrape_hrd_for_domain(domain: str, deadline: float | None = None,
         jitter=settings.PORTAL_JITTER,
         host_cap=settings.PORTAL_HOST_CAP,
     )
-    urls = discover_listing_urls(brand, "", max_urls=max_pages * 2)
+    urls = discover_listing_urls(brand, "", max_urls=max_pages * 2,
+                                 limiter=limiter, deadline=deadline)
     stats["listings_found"] = len(urls)
 
     fetched = 0
@@ -500,9 +630,9 @@ def scrape_hrd_for_domain(domain: str, deadline: float | None = None,
         if _portal_of(url) in SKIP_FETCH_DOMAINS:
             continue
         found, _, _ = _harvest_page(url, limiter)
-        if not found:
+        if found is None:
             continue
-        fetched += 1
+        fetched += 1  # a page we actually managed to fetch (even with 0 emails)
         for e in found:
             # reuse domain_tasks validation semantics: only @domain addresses
             local, _, maildomain = e.rpartition("@")
@@ -514,6 +644,9 @@ def scrape_hrd_for_domain(domain: str, deadline: float | None = None,
     stats["emails_found"] = len(emails)
     if not emails and not stats["listings_found"]:
         stats["message"] = "Tidak ada listing job portal ditemukan untuk domain ini."
+    elif not emails:
+        stats["message"] = ("Listing ditemukan, tapi portal modern tidak menampilkan "
+                            "email HRD publik (pakai form aplikasi).")
     return emails, stats, email_urls
 
 

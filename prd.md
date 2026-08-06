@@ -61,7 +61,7 @@ Output (sudah diimplementasikan):
 - **VIRE Atlas knowledge graph (v1.4)**: hasil scan tidak lagi disimpan sebagai 1 blob JSON — dipecah menjadi knowledge model ternormalisasi (`atlas_domains`, `atlas_emails`, `atlas_sources`, `atlas_relationships`, dll, 12 tabel). Konsep **Scan** (proses: job/progress/status) dipisah dari **Atlas** (intelligence: hasil yang sudah dinormalisasi & di-cache). Setiap entity punya lifecycle sendiri (first_seen/last_seen), update independen, dan siap untuk graph visualization.
 - Referensi search engine publik — **multi-query (v1.2)**: Bing (RSS) & DuckDuckGo (HTML POST), 3-4 variasi dork per engine
 - Google dorking manual — query siap-pakai (`site:"@domain" email`, dll) yang dibuka di browser user sendiri; Google memblokir scraping otomatis, jadi dork dijalankan manual
-- Verifikasi SMTP per email (RCPT TO probe ke mail server — tanpa mengirim email): status **aktif / tidak ada / tak tentu**, plus deteksi mail server catch-all, sender netral (noreply@example.org), budget waktu 45 detik/scan
+- Verifikasi SMTP per email (RCPT TO probe ke mail server — tanpa mengirim email): status **aktif / tidak ada / tak tentu**, plus deteksi mail server catch-all, sender netral (noreply@example.org), budget waktu 45 detik/scan — **default OFF sejak v1.4.1** (`SMTP_VERIFY_ENABLED=false`): tujuan utama app adalah mengumpulkan email yang **pernah muncul di internet** sebagai rujukan, jadi email non-aktif pun tetap berguna dan tidak perlu diverifikasi. Aktifkan kembali hanya jika butuh filter mailbox aktif (scan lebih lama)
 - Security posture (MX/SPF/DMARC terdeteksi atau tidak)
 - Recon stats (halaman di-crawl, subdomain, dokumen, OCR, hasil search, timing)
 - Confidence score
@@ -335,7 +335,7 @@ lama di-migrate ke `atlas_domains` + `atlas_histories`.
 - ⏳ Graph visualization
 - ⏳ Scheduled scans
 - ⏳ Export functionality
-- ✅ SMTP verification (RCPT TO probe ke MX server, tanpa kirim email; deteksi catch-all) — selesai di v1.1.1
+- ✅ SMTP verification (RCPT TO probe ke MX server, tanpa kirim email; deteksi catch-all) — selesai di v1.1.1, **dimatikan default di v1.4.1** (kumpul email sebagai rujukan, tanpa validasi aktif)
 - ✅ Public document crawler — selesai di v1.2
 - ✅ Local OCR (Tesseract) untuk gambar & PDF scan — selesai di v1.2
 - ✅ Subdomain enumeration — selesai di v1.2

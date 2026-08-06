@@ -52,7 +52,7 @@ const SCAN_STEPS = [
   { icon: Search, label: "Searching search engines (multi-query)" },
   { icon: History, label: "Checking Wayback Machine archives" },
   { icon: FileText, label: "Running OCR on images & scanned PDFs" },
-  { icon: Sparkles, label: "Verifying via SMTP & building results" },
+  { icon: Sparkles, label: "Building results & confidence score" },
 ];
 
 const SCAN_MODES: { value: string; label: string; desc: string; icon: LucideIcon }[] = [
@@ -79,14 +79,14 @@ const SCAN_MODES: { value: string; label: string; desc: string; icon: LucideIcon
 // Mode -> source list shown in the scan console footer
 const MODE_ENGINES: Record<string, string> = {
   quick: "dns · web",
-  smart: "dns · web · docs · subdomains · whois · ct · patterns · smtp",
-  deep: "dns · web · docs · subdomains · whois · ct · patterns · smtp · search · wayback · github · mailing · ocr · jobportal · tech",
+  smart: "dns · web · docs · subdomains · whois · ct",
+  deep: "dns · web · docs · subdomains · whois · ct · search · wayback · github · mailing · ocr · jobportal · tech",
 };
 
 const MODE_ENGINE_COUNT: Record<string, number> = {
   quick: 2,
-  smart: 8,
-  deep: 15,
+  smart: 6,
+  deep: 13,
 };
 
 // Atlas freshness badge config
@@ -1027,17 +1027,19 @@ export default function Home() {
                       <Mail className="w-4 h-4 text-primary" />
                       <b className="text-foreground">{emailStats.observed ?? 0}</b> emails found
                     </span>
-                    <span className="flex items-center gap-1.5">
-                      <CheckCircle className="w-4 h-4 text-emerald-400" />
-                      <b className="text-foreground">{emailStats.smtp_ok ?? 0}</b> active (SMTP)
-                    </span>
+                    {smtpCheck.enabled && (
+                      <span className="flex items-center gap-1.5">
+                        <CheckCircle className="w-4 h-4 text-emerald-400" />
+                        <b className="text-foreground">{emailStats.smtp_ok ?? 0}</b> active (SMTP)
+                      </span>
+                    )}
                     {(emailStats.pattern_verified ?? 0) > 0 && (
                       <span className="flex items-center gap-1.5">
                         <Sparkles className="w-4 h-4 text-emerald-400" />
                         <b className="text-foreground">{emailStats.pattern_verified ?? 0}</b> verified patterns
                       </span>
                     )}
-                    {(emailStats.smtp_rejected ?? 0) > 0 && (
+                    {smtpCheck.enabled && (emailStats.smtp_rejected ?? 0) > 0 && (
                       <span className="flex items-center gap-1.5">
                         <AlertTriangle className="w-4 h-4 text-red-400" />
                         <b className="text-foreground">{emailStats.smtp_rejected ?? 0}</b> invalid
@@ -1775,6 +1777,27 @@ export default function Home() {
                       {(ocrStats.emails_found ?? 0) > 0 && (
                         <span className="text-emerald-400">→ {(ocrStats.emails_found ?? 0)} emails found</span>
                       )}
+                    </div>
+                  ) : null}
+                  {(!jobportalStats.skipped && (jobportalStats.emails_found ?? 0) === 0) ||
+                    (jobportalStats.skipped && result.mode !== "deep") ? (
+                    <div className="mt-4 pt-4 border-t border-border/50 text-[11px] text-rose-300/90 flex items-start gap-2">
+                      <Handshake className="w-3.5 h-3.5 shrink-0 mt-0.5" />
+                      <span>
+                        Job portals:{" "}
+                        {jobportalStats.skipped ? (
+                          <span className="text-muted-foreground">
+                            skipped di mode ini — aktif di <b>Atlas Deep</b> scan
+                          </span>
+                        ) : (
+                          <span className="text-muted-foreground">
+                            {(jobportalStats.listings_found ?? 0)} listing dicek ·{" "}
+                            {(jobportalStats.pages_fetched ?? 0)} halaman di-fetch ·{" "}
+                            {jobportalStats.message ||
+                              "portal modern tidak menampilkan email HRD publik (pakai form aplikasi)"}
+                          </span>
+                        )}
+                      </span>
                     </div>
                   ) : null}
                   <div className="mt-4 pt-4 border-t border-border/50 flex items-center justify-between text-xs text-muted-foreground font-mono">

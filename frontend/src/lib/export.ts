@@ -231,9 +231,11 @@ export function exportToExcel(result: ExportResult) {
   stats.push([]);
   stats.push(["EMAILS", ""]);
   stats.push(["Total Emails Found", r?.email_stats?.observed ?? 0]);
-  stats.push(["Active (SMTP)", r?.email_stats?.smtp_ok ?? 0]);
-  stats.push(["Invalid (SMTP)", r?.email_stats?.smtp_rejected ?? 0]);
-  stats.push(["Inconclusive (SMTP)", r?.email_stats?.smtp_unknown ?? 0]);
+  if (r?.smtp_check?.enabled) {
+    stats.push(["Active (SMTP)", r?.email_stats?.smtp_ok ?? 0]);
+    stats.push(["Invalid (SMTP)", r?.email_stats?.smtp_rejected ?? 0]);
+    stats.push(["Inconclusive (SMTP)", r?.email_stats?.smtp_unknown ?? 0]);
+  }
   stats.push(["Pattern Verified", r?.email_stats?.pattern_verified ?? 0]);
   stats.push([]);
   stats.push(["EMAIL SECURITY", ""]);
