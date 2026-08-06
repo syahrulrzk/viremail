@@ -19,6 +19,8 @@ class ScanStatus(str, enum.Enum):
 
 
 class Scan(Base):
+    """Top-level scan record — the user-facing request (one per search)."""
+
     __tablename__ = "scans"
 
     id = Column(Integer, primary_key=True, index=True)
@@ -33,3 +35,4 @@ class Scan(Base):
     completed_at = Column(DateTime(timezone=True), nullable=True)
 
     user = relationship("User", backref="scans")
+    jobs = relationship("ScanJob", back_populates="scan", cascade="all, delete-orphan")

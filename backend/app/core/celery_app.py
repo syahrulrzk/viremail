@@ -5,7 +5,7 @@ celery_app = Celery(
     "osintmail",
     broker=settings.REDIS_URL,
     backend=settings.REDIS_URL,
-    include=["app.tasks.domain_tasks"]
+    include=["app.tasks.domain_tasks", "app.tasks.portals"]
 )
 
 celery_app.conf.update(

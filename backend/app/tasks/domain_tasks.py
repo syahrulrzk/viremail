@@ -21,16 +21,18 @@ import io
 import ipaddress
 import json
 import os
+import random
 import re
 import secrets
 import shutil
 import smtplib
 import subprocess
 import tempfile
+import threading
 import time
 import xml.etree.ElementTree as ET
 import zipfile
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from urllib.parse import urljoin, urlparse, parse_qs
 
 import dns.resolver
@@ -39,6 +41,19 @@ from bs4 import BeautifulSoup
 
 from app.core.celery_app import celery_app
 from app.core.config import settings
+from app.tasks import portals as portals_mod
+
+# Keep-alive sessions: one requests.Session per worker thread so repeated
+# fetches to the same host reuse the TCP/TLS connection (big crawl speedup).
+_SESSION_LOCAL = threading.local()
+
+
+def _http_session() -> requests.Session:
+    s = getattr(_SESSION_LOCAL, "s", None)
+    if s is None:
+        s = requests.Session()
+        _SESSION_LOCAL.s = s
+    return s
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -82,26 +97,68 @@ SOURCE_PRIORITY = {
     "mailto": 0,
     "website": 1,
     "careers": 2,
-    "document": 3,
-    "security_txt": 4,
-    "search": 5,
-    "wayback": 6,
-    "github": 7,
-    "mailing_list": 8,
-    "ocr": 9,
-    "bbot": 10,
-    "subdomain": 11,
-    "whois": 12,
-    "pattern_verified": 13,
+    "jobportal": 3,
+    "document": 4,
+    "security_txt": 5,
+    "search": 6,
+    "wayback": 7,
+    "github": 8,
+    "mailing_list": 9,
+    "ocr": 10,
+    "bbot": 11,
+    "subdomain": 12,
+    "whois": 13,
+    "pattern_verified": 14,
 }
 
 # User-selectable data sources — the frontend sends the enabled subset with
 # each scan (toggle chips under the search bar).
 SOURCE_KEYS = [
     "dns", "website", "docs", "subdomains", "whois", "search",
-    "wayback", "github", "mailing", "patterns", "smtp",
+    "wayback", "github", "mailing", "patterns", "smtp", "jobportal",
 ]
 DEFAULT_SOURCES = list(SOURCE_KEYS)
+
+# Atlas-first: 3 scan modes, each with its own source subset & time budget.
+#   quick — <10s baseline: DNS(+DKIM), homepage + contact crawl, robots/security.txt
+#   smart — 30-60s default: quick + full crawl, docs, CT, subdomains, patterns, SMTP
+#   deep  — 2-10min max intel: smart + search engines, wayback, github, mailing,
+#           OCR, job portals, BBOT + Holehe, technology detection
+MODE_SOURCES = {
+    "quick": ["dns", "website"],
+    "smart": [
+        "dns", "website", "docs", "subdomains", "whois", "ct",
+        "patterns", "smtp",
+    ],
+    "deep": [
+        "dns", "website", "docs", "subdomains", "whois", "ct",
+        "patterns", "smtp", "search", "wayback", "github", "mailing",
+        "ocr", "jobportal", "tech",
+    ],
+}
+MODE_DEADLINES = {"quick": 60.0, "smart": 300.0, "deep": 540.0}
+
+# Confidence per source (used for the per-email confidence score).
+SOURCE_CONFIDENCE = {
+    "mailto": 95,
+    "website": 95,
+    "document": 95,
+    "security_txt": 90,
+    "careers": 90,
+    "jobportal": 85,
+    "ct": 90,
+    "whois": 85,
+    "search": 80,
+    "wayback": 80,
+    "github": 80,
+    "mailing_list": 75,
+    "ocr": 70,
+    "subdomain": 70,
+    "bbot": 75,
+    "pattern_verified": 60,
+}
+# SMTP 'ok' overrides any source confidence (100% verified mailbox).
+SMTP_CONFIDENCE_OK = 100
 
 DNS_RECORD_TYPES = ["A", "AAAA", "MX", "NS", "TXT"]
 
@@ -249,7 +306,8 @@ def fetch(url: str, timeout: int = HTTP_TIMEOUT, max_redirects: int = 4) -> requ
         if is_private_host(urlparse(current).hostname or ""):
             return None
         try:
-            resp = requests.get(current, timeout=timeout, headers=HEADERS, allow_redirects=False)
+            resp = _http_session().get(current, timeout=timeout, headers=HEADERS,
+                                       allow_redirects=False)
         except Exception:
             return None
         if resp.is_redirect:
@@ -345,7 +403,11 @@ def name_patterns(name: str, domain: str) -> list:
 # ---------------------------------------------------------------------------
 
 def collect_dns(domain: str) -> tuple:
-    """Return (dns_records, spf, dmarc, mx_count)."""
+    """Return (dns_records, spf, dmarc, mx_count, dkim).
+
+    DKIM: queries the common selectors (`default`, `google`, `selector1/2`, ...)
+    under `_domainkey.<domain>` and stores the first valid `v=DKIM1` record.
+    """
     resolver = dns.resolver.Resolver()
     resolver.timeout = 2
     resolver.lifetime = 4
@@ -375,8 +437,22 @@ def collect_dns(domain: str) -> tuple:
     except Exception:
         pass
 
+    dkim = None
+    for selector in ("default", "google", "selector1", "selector2",
+                     "k1", "k2", "s1", "s2", "mail", "x"):
+        try:
+            for txt in resolver.resolve(f"{selector}._domainkey.{domain}", "TXT"):
+                txt_str = str(txt).strip('"')
+                if txt_str.startswith("v=DKIM1"):
+                    dkim = {"selector": selector, "record": txt_str}
+                    break
+        except Exception:
+            continue
+        if dkim:
+            break
+
     mx_count = len(dns_records.get("MX", []))
-    return dns_records, spf, dmarc, mx_count
+    return dns_records, spf, dmarc, mx_count, dkim
 
 
 # ---------------------------------------------------------------------------
@@ -513,11 +589,26 @@ def _harvest(base: str, text: str, soup: BeautifulSoup, emails_by_source: dict,
             img_urls.append(absolute)
 
 
-def crawl_site(domain: str, disallowed: list, sitemap_urls: list) -> tuple:
-    """BFS crawl up to MAX_CRAWL_PAGES pages (depth <= MAX_CRAWL_DEPTH).
+CRAWL_WORKERS = 10  # parallel page fetchers during the deep crawl
+
+
+def _crawl_fetch(url: str, depth: int) -> dict | None:
+    """Fetch one page (worker unit) -> dict with harvest results, or None."""
+    resp = fetch(url, timeout=5)
+    if not resp or resp.status_code != 200:
+        return None
+    soup = BeautifulSoup(resp.text, "html.parser")
+    return {"url": url, "depth": depth, "text": resp.text, "soup": soup}
+
+
+def crawl_site(domain: str, disallowed: list, sitemap_urls: list,
+               max_pages: int | None = None) -> tuple:
+    """BFS crawl up to `max_pages` (default MAX_CRAWL_PAGES) pages
+    (depth <= MAX_CRAWL_DEPTH), fetching pages in parallel batches.
 
     Returns (emails_by_source, crawl_stats, doc_urls, img_urls, team_texts).
     """
+    max_pages = max_pages or MAX_CRAWL_PAGES
     base_urls = [
         f"https://{domain}", f"http://{domain}",
         f"https://www.{domain}", f"http://www.{domain}",
@@ -544,22 +635,28 @@ def crawl_site(domain: str, disallowed: list, sitemap_urls: list) -> tuple:
             return
         frontier.append((_priority(url), depth, url))
 
-    # homepage (depth 0)
-    for base in base_urls:
-        resp = fetch(base, timeout=6)
-        if not resp or resp.status_code != 200:
-            continue
+    # homepage (depth 0) — fetch all candidates in parallel, use the first OK
+    home = None
+    with ThreadPoolExecutor(max_workers=len(base_urls)) as ex:
+        for res in ex.map(lambda u: _crawl_fetch(u, 0), base_urls):
+            if res is None:
+                continue
+            home = res
+            break
+    if max_pages <= 0:
+        max_pages = 1
+    if home:
         pages_crawled += 1
-        soup = BeautifulSoup(resp.text, "html.parser")
-        _harvest(base, resp.text, soup, emails_by_source, doc_urls, img_urls, domain, emails_by_url)
-        if len(team_texts) < MAX_TEAM_PAGES and _is_team_page(base):
-            team_texts.append(resp.text)
-        visited.add(base.rstrip("/"))
-        for link in soup.find_all("a", href=True):
+        _harvest(home["url"], home["text"], home["soup"], emails_by_source,
+                 doc_urls, img_urls, domain, emails_by_url)
+        if len(team_texts) < MAX_TEAM_PAGES and _is_team_page(home["url"]):
+            team_texts.append(home["text"])
+        visited.add(home["url"].rstrip("/"))
+        for link in home["soup"].find_all("a", href=True):
             href = link["href"].strip()
             if href.startswith(("#", "javascript:", "tel:", "mailto:")):
                 continue
-            absolute = urljoin(base, href)
+            absolute = urljoin(home["url"], href)
             if not is_same_site(absolute, domain):
                 continue
             path = urlparse(absolute).path or "/"
@@ -567,13 +664,12 @@ def crawl_site(domain: str, disallowed: list, sitemap_urls: list) -> tuple:
                 continue
             links_found += 1
             _enqueue(absolute, 1)
-        break
 
     # sitemap URLs also as depth-1 seeds
     for su in sitemap_urls:
         _enqueue(su, 1)
 
-    # de-dupe + contact pages first
+    # de-dupe + contact pages first, then crawl in parallel waves
     seen: set = set()
     ordered: list = []
     for prio, depth, url in sorted(frontier, key=lambda x: (x[0], x[1])):
@@ -584,36 +680,53 @@ def crawl_site(domain: str, disallowed: list, sitemap_urls: list) -> tuple:
         ordered.append((prio, depth, url))
 
     idx = 0
-    while (idx < len(ordered) and pages_crawled < MAX_CRAWL_PAGES):
-        prio, depth, url = ordered[idx]
-        idx += 1
-        key = url.rstrip("/")
-        if key in visited:
-            continue
-        visited.add(key)
-        resp = fetch(url, timeout=5)
-        if not resp or resp.status_code != 200:
-            continue
-        pages_crawled += 1
-        max_depth = max(max_depth, depth)
-        soup = BeautifulSoup(resp.text, "html.parser")
-        _harvest(url, resp.text, soup, emails_by_source, doc_urls, img_urls, domain, emails_by_url)
-        if len(team_texts) < MAX_TEAM_PAGES and _is_team_page(url):
-            team_texts.append(resp.text)
-        if depth < MAX_CRAWL_DEPTH:
-            for link in soup.find_all("a", href=True):
-                href = link["href"].strip()
-                if href.startswith(("#", "javascript:", "tel:", "mailto:")):
+    while (idx < len(ordered) and pages_crawled < max_pages):
+        remaining = max_pages - pages_crawled
+        batch = ordered[idx:idx + CRAWL_WORKERS]
+        idx += len(batch)
+        if not batch:
+            break
+        new_links: list = []  # (priority, depth, url) discovered this wave
+        with ThreadPoolExecutor(max_workers=min(CRAWL_WORKERS, len(batch))) as ex:
+            for res in ex.map(lambda item: _crawl_fetch(item[2], item[1]), batch):
+                if res is None:
                     continue
-                absolute = urljoin(url, href)
-                if not is_same_site(absolute, domain):
+                url, depth = res["url"], res["depth"]
+                key = url.rstrip("/")
+                if key in visited:
                     continue
-                if not is_allowed(urlparse(absolute).path or "/", disallowed):
-                    continue
-                if absolute.rstrip("/") in visited:
-                    continue
-                links_found += 1
-                ordered.append((_priority(absolute), depth + 1, absolute))
+                visited.add(key)
+                if pages_crawled >= max_pages:
+                    break
+                pages_crawled += 1
+                max_depth = max(max_depth, depth)
+                _harvest(url, res["text"], res["soup"], emails_by_source,
+                         doc_urls, img_urls, domain, emails_by_url)
+                if len(team_texts) < MAX_TEAM_PAGES and _is_team_page(url):
+                    team_texts.append(res["text"])
+                if depth < MAX_CRAWL_DEPTH:
+                    for link in res["soup"].find_all("a", href=True):
+                        href = link["href"].strip()
+                        if href.startswith(("#", "javascript:", "tel:", "mailto:")):
+                            continue
+                        absolute = urljoin(url, href)
+                        if not is_same_site(absolute, domain):
+                            continue
+                        if not is_allowed(urlparse(absolute).path or "/", disallowed):
+                            continue
+                        if absolute.rstrip("/") in visited:
+                            continue
+                        links_found += 1
+                        new_links.append((_priority(absolute), depth + 1, absolute))
+        # merge this wave's discoveries, contact pages first
+        seen_wave: set = set()
+        for prio, depth, url in sorted(new_links, key=lambda x: (x[0], x[1])):
+            key = url.rstrip("/")
+            if key in seen or key in seen_wave:
+                continue
+            seen_wave.add(key)
+            ordered.append((prio, depth, url))
+        seen |= seen_wave
 
     return emails_by_source, {
         "pages_crawled": pages_crawled,
@@ -660,17 +773,27 @@ def _document_text(url: str) -> str | None:
 
 
 def extract_emails_from_docs(doc_urls: list, domain: str) -> tuple:
-    """Download public documents and pull emails -> (emails, doc_stats)."""
+    """Download public documents (in parallel) and pull emails.
+
+    Returns (emails, doc_stats, email_urls).
+    """
     emails: dict = {}
     email_urls: dict = {}
-    parsed = 0
-    for url in doc_urls:
+
+    def _parse(url: str) -> tuple:
         text = _document_text(url)
         if not text:
-            continue
-        parsed += 1
-        for e in extract_emails(text):
-            if is_valid_target_email(e, domain):
+            return url, set()
+        found = {e for e in extract_emails(text) if is_valid_target_email(e, domain)}
+        return url, found
+
+    parsed = 0
+    with ThreadPoolExecutor(max_workers=min(6, len(doc_urls) or 1)) as ex:
+        for url, found in ex.map(_parse, doc_urls):
+            if not found:
+                continue
+            parsed += 1
+            for e in found:
                 emails.setdefault(e, "document")
                 email_urls.setdefault(e, url)
     return emails, {"docs_found": len(doc_urls), "docs_parsed": parsed,
@@ -690,8 +813,8 @@ def _download_bytes(url: str) -> bytes | None:
         if is_private_host(urlparse(current).hostname or ""):
             return None
         try:
-            resp = requests.get(current, timeout=HTTP_TIMEOUT, headers=HEADERS,
-                                allow_redirects=False, stream=True)
+            resp = _http_session().get(current, timeout=HTTP_TIMEOUT, headers=HEADERS,
+                                       allow_redirects=False, stream=True)
         except Exception:
             return None
         try:
@@ -836,24 +959,151 @@ def enumerate_subdomains(domain: str) -> list:
     return active
 
 
+def _crawl_one_subdomain(host: str, domain: str) -> tuple:
+    """Fetch one subdomain homepage -> (emails, url) or (None, None)."""
+    for scheme in ("https", "http"):
+        resp = fetch(f"{scheme}://{host}/", timeout=5)
+        if not resp or resp.status_code != 200:
+            continue
+        soup = BeautifulSoup(resp.text, "html.parser")
+        found = {
+            e for e in extract_emails(resp.text) | extract_mailto_emails(soup)
+            if is_valid_target_email(e, domain)
+        }
+        return found, f"{scheme}://{host}/"
+    return None, None
+
+
 def crawl_subdomains(active: list, domain: str) -> tuple:
-    """Fetch homepages of discovered subdomains -> (emails_by_source, stats)."""
+    """Fetch homepages of discovered subdomains (in parallel)
+    -> (emails_by_source, stats)."""
     emails: dict = {}
     email_urls: dict = {}
     crawled = 0
-    for host in active[:MAX_SUBDOMAIN_CRAWLS]:
-        for scheme in ("https", "http"):
-            resp = fetch(f"{scheme}://{host}/", timeout=5)
-            if not resp or resp.status_code != 200:
+    hosts = active[:MAX_SUBDOMAIN_CRAWLS]
+    with ThreadPoolExecutor(max_workers=min(5, len(hosts) or 1)) as ex:
+        for found, url in ex.map(lambda h: _crawl_one_subdomain(h, domain), hosts):
+            if found is None:
                 continue
             crawled += 1
-            soup = BeautifulSoup(resp.text, "html.parser")
-            for e in extract_emails(resp.text) | extract_mailto_emails(soup):
-                if is_valid_target_email(e, domain):
-                    emails.setdefault(e, "subdomain")
-                    email_urls.setdefault(e, f"{scheme}://{host}/")
-            break
+            for e in found:
+                emails.setdefault(e, "subdomain")
+                email_urls.setdefault(e, url)
     return emails, {"subdomains_crawled": crawled}, email_urls
+
+
+# ---------------------------------------------------------------------------
+# Certificate Transparency (crt.sh — public CT log search, no API key)
+# ---------------------------------------------------------------------------
+
+def search_crtsh(domain: str, timeout: int = 25) -> tuple:
+    """Query crt.sh for certificates issued to the domain -> (subdomains, stats).
+
+    CT logs are a legit public source of subdomain names (any cert ever issued
+    is logged). Returns deduped, sorted subdomain names (plain + wildcard).
+    """
+    subdomains: set = set()
+    stats = {"requests": 0, "certs_found": 0, "names_found": 0, "message": ""}
+    try:
+        resp = requests.get(
+            "https://crt.sh/",
+            params={"q": f"%25.{domain}", "output": "json"},
+            headers=HEADERS, timeout=timeout,
+        )
+        stats["requests"] += 1
+        if resp.status_code != 200:
+            stats["message"] = f"crt.sh HTTP {resp.status_code}."
+            return [], stats
+        rows = resp.json()
+        stats["certs_found"] = len(rows)
+        for row in rows:
+            for name in str(row.get("name_value") or "").splitlines():
+                name = name.strip().lower().lstrip("*.")
+                if name.endswith(f".{domain}"):
+                    subdomains.add(name)
+    except Exception as e:
+        stats["message"] = f"crt.sh error: {type(e).__name__}."
+    stats["names_found"] = len(subdomains)
+    return sorted(subdomains), stats
+
+
+# ---------------------------------------------------------------------------
+# Technology detection (self-built fingerprinting — no external API)
+# ---------------------------------------------------------------------------
+
+TECH_PATTERNS = [
+    # (name, category, [evidence substrings, lowercase, matched against html])
+    ("WordPress", "CMS", ["wp-content", "wp-includes", "wordpress"]),
+    ("Next.js", "Framework", ["__next", "next/static", "_next/static"]),
+    ("React", "Framework", ["__react", "react.development", "react.production"]),
+    ("Vue.js", "Framework", ["__vue", "vue.global", "data-v-"]),
+    ("Angular", "Framework", ["ng-version", "@angular/core"]),
+    ("Laravel", "Framework", ["laravel_session", "csrf-token"]),
+    ("Django", "Framework", ["django", "csrfmiddlewaretoken"]),
+    ("Ruby on Rails", "Framework", ["_rails_session", "rails"]),
+    ("ASP.NET", "Framework", ["__viewstate", "asp.net"]),
+    ("Shopify", "E-commerce", ["myshopify.com", "cdn.shopify.com"]),
+    ("WooCommerce", "E-commerce", ["woocommerce"]),
+    ("Bootstrap", "CSS", ["bootstrap.min.css", "bootstrap@"]),
+    ("Tailwind CSS", "CSS", ["tailwindcss", "@tailwindcss"]),
+    ("jQuery", "Library", ["jquery.min.js", "jquery@"]),
+    ("Google Analytics", "Analytics", ["google-analytics", "googletagmanager", "gtag("]),
+    ("Meta Pixel", "Analytics", ["facebook.net", "fbq("]),
+    ("Cloudflare", "CDN/Proxy", ["cdn-cgi", "cf-ray", "cloudflare"]),
+    ("reCAPTCHA", "Security", ["recaptcha", "grecaptcha"]),
+    ("hCaptcha", "Security", ["hcaptcha"]),
+]
+
+
+def detect_technologies(domain: str) -> tuple:
+    """Fingerprint the tech stack from the homepage + response headers.
+
+    Self-built heuristics: `Server`/`X-Powered-By` headers, `meta generator`,
+    cookie names, and known marker strings in the HTML. No third-party API.
+    Returns (technologies, stats).
+    """
+    techs: list = []
+    stats = {"scanned": False, "found": 0, "message": ""}
+    resp = fetch(f"https://{domain}/", timeout=6)
+    if not resp or resp.status_code != 200:
+        resp = fetch(f"http://{domain}/", timeout=6)
+    if not resp or resp.status_code != 200:
+        stats["message"] = "Homepage tidak bisa diakses."
+        return techs, stats
+    stats["scanned"] = True
+
+    def _add(name: str, category: str, evidence: str) -> None:
+        if not any(t["name"] == name for t in techs):
+            techs.append({"name": name, "category": category, "evidence": evidence})
+
+    # HTTP headers
+    server = resp.headers.get("Server", "")
+    powered = resp.headers.get("X-Powered-By", "")
+    cf_ray = "cf-ray" in {k.lower(): v for k, v in resp.headers.items()}
+    if server:
+        _add(f"Server: {server}", "Server", "HTTP header 'Server'")
+    if powered:
+        _add(f"X-Powered-By: {powered}", "Server", "HTTP header 'X-Powered-By'")
+    if cf_ray:
+        _add("Cloudflare", "CDN/Proxy", "HTTP header 'CF-Ray'")
+
+    # meta generator
+    soup = BeautifulSoup(resp.text, "html.parser")
+    for meta in soup.find_all("meta"):
+        if (meta.get("name") or "").lower() == "generator" and meta.get("content"):
+            _add(f"Generator: {meta['content'].strip()}", "Generator", "<meta name=generator>")
+            break
+
+    # HTML markers
+    low = resp.text[:300_000].lower()
+    for name, category, needles in TECH_PATTERNS:
+        for n in needles:
+            if n.lower() in low:
+                _add(name, category, f"HTML marker '{n}'")
+                break
+
+    stats["found"] = len(techs)
+    return techs, stats
 
 
 # ---------------------------------------------------------------------------
@@ -1051,34 +1301,52 @@ def search_wayback(domain: str, deadline: float | None = None) -> tuple:
     if not rows or len(rows) < 2:
         return emails, stats, email_urls
 
-    stats["pages_found"] = len(rows) - 1
+    # collect up to MAX_WAYBACK_PAGES candidate snapshots, then fetch in parallel
+    candidates = []
     for row in rows[1:]:
         if len(row) < 2:
             continue
-        if stats["pages_fetched"] >= MAX_WAYBACK_PAGES:
-            break
-        if deadline is not None and time.monotonic() > deadline:
+        if len(candidates) >= MAX_WAYBACK_PAGES:
             break
         original, ts = row[0], row[1]
         if not is_same_site(original, domain):
             continue
         if _WAYBACK_ASSET_RE.search(urlparse(original).path or "/"):
             continue
+        candidates.append((original, ts))
+    stats["pages_found"] = len(candidates)
+
+    def _fetch_snapshot(item) -> tuple:
+        original, ts = item
+        if deadline is not None and time.monotonic() > deadline:
+            return None
         snapshot = f"https://web.archive.org/web/{ts}id_/{original}"
         resp = fetch(snapshot, timeout=10)
         if not resp or resp.status_code != 200:
-            continue
+            return None
         ctype = resp.headers.get("Content-Type", "")
         if ctype and "html" not in ctype.lower():
-            continue
-        stats["pages_fetched"] += 1
+            return None
         soup = BeautifulSoup(resp.text, "html.parser")
-        for e in extract_emails(resp.text):
-            if is_valid_target_email(e, domain):
-                emails.setdefault(e, "wayback")
-                email_urls.setdefault(e, snapshot)
-        for e in extract_mailto_emails(soup):
-            if is_valid_target_email(e, domain):
+        found = {
+            e for e in extract_emails(resp.text)
+            if is_valid_target_email(e, domain)
+        }
+        found |= {
+            e for e in extract_mailto_emails(soup)
+            if is_valid_target_email(e, domain)
+        }
+        return found, snapshot
+
+    with ThreadPoolExecutor(max_workers=min(6, len(candidates) or 1)) as ex:
+        for res in ex.map(_fetch_snapshot, candidates):
+            if not res:
+                continue
+            if deadline is not None and time.monotonic() > deadline:
+                break
+            found, snapshot = res
+            stats["pages_fetched"] += 1
+            for e in found:
                 emails.setdefault(e, "wayback")
                 email_urls.setdefault(e, snapshot)
 
@@ -1358,11 +1626,18 @@ def verify_emails_smtp(emails: list, mx_hosts: list, domain: str, *,
         return {e: "unknown" for e in emails}, {**stats, "unknown": len(emails)}, meta
 
     status_map: dict = {}
-    for email in emails:
-        if (max_checks is not None and len(status_map) >= max_checks) \
-                or time.monotonic() > deadline:
-            break
-        status_map[email] = _smtp_probe(working_host, email, from_addr, SMTP_TIMEOUT)
+    # Probe in parallel (small pool) but respect the shared deadline & cap.
+    todo = emails[:max_checks] if max_checks is not None else emails
+    SMTP_WORKERS = 3
+    with ThreadPoolExecutor(max_workers=SMTP_WORKERS) as ex:
+        futures = {ex.submit(_smtp_probe, working_host, e, from_addr, SMTP_TIMEOUT): e
+                   for e in todo}
+        for fut in as_completed(futures):
+            e = futures[fut]
+            if time.monotonic() > deadline:
+                status_map[e] = "unknown"
+                continue
+            status_map[e] = fut.result()
     for email in emails:
         if email not in status_map:
             status_map[email] = "unchecked"
@@ -1492,31 +1767,45 @@ def holehe_check(emails: list, timeout: int) -> dict:
 # Task
 # ---------------------------------------------------------------------------
 
-@celery_app.task(name="app.tasks.domain_tasks.process_domain_search")
-def process_domain_search(domain: str, scan_id: int, deep: bool = False,
+@celery_app.task(bind=True, name="app.tasks.domain_tasks.process_domain_search")
+def process_domain_search(self, domain: str, scan_id: int, mode: str = "smart",
                           sources: list | None = None):
-    """Discover email addresses for a domain using self-built OSINT sources."""
+    """Atlas-first domain scan — discover emails for a domain.
+
+    Three modes (mode = quick | smart | deep), each a different source subset
+    and time budget. Emits PROGRESS state updates after every stage so the SSE
+    endpoint can stream partial results to the frontend in real time.
+    """
     # NOTE: use removeprefix, NOT lstrip — lstrip("www.") strips ANY leading
     # "w"/"." chars (waicast.id -> aicast.id!).
     domain = (domain or "").strip().lower().removeprefix("www.").rstrip(".")
-    enabled = set(sources or DEFAULT_SOURCES)
+    mode = mode if mode in MODE_SOURCES else "smart"
+    enabled = set(sources or MODE_SOURCES[mode])
     started = time.time()
     timings = {}
-    # Hard global budget: keeps the whole scan under the API's task.get()
-    # timeout even for pathological domains (slow crawl / hung MX / etc.).
-    # Deep mode gets a bigger budget because BBOT + Holehe need time.
-    HARD_DEADLINE = 540.0 if deep else 260.0
+    HARD_DEADLINE = MODE_DEADLINES[mode]
 
     def _remaining() -> float:
         return HARD_DEADLINE - (time.time() - started)
 
-    # 1) DNS + email security posture
+    def _emit(stage: str, percent: int, partial: dict | None = None) -> None:
+        """Push a progress update to the result backend (SSE consumer)."""
+        meta = {"stage": stage, "percent": percent}
+        if partial:
+            meta["partial"] = partial
+        try:
+            self.update_state(state="PROGRESS", meta=meta)
+        except Exception:
+            pass
+
+    # 1) DNS + email security posture (incl. DKIM)
     t0 = time.time()
     if "dns" in enabled:
-        dns_records, spf, dmarc, mx_count = collect_dns(domain)
+        dns_records, spf, dmarc, mx_count, dkim = collect_dns(domain)
     else:
-        dns_records, spf, dmarc, mx_count = {}, None, None, 0
+        dns_records, spf, dmarc, mx_count, dkim = {}, None, None, 0, None
     timings["dns"] = int((time.time() - t0) * 1000)
+    _emit("DNS + email security", 6)
 
     # 2) Deep crawl (BFS depth-2, up to 40 pages) + robots/sitemap/security.txt
     #    + career/job pages + team-page texts (for name-pattern generation)
@@ -1525,12 +1814,16 @@ def process_domain_search(domain: str, scan_id: int, deep: bool = False,
         disallowed, robots_sitemaps = get_robots(domain)
         sitemap_urls = get_sitemap_urls(domain, robots_sitemaps)
         security_found, security_contacts, security_txt_urls = get_security_txt(domain)
+        # quick mode: homepage + priority contact pages only (<10s target)
+        crawl_limit = 6 if mode == "quick" else None
         crawled_emails, crawl_stats, doc_urls, img_urls, team_texts, crawled_email_urls = crawl_site(
-            domain, disallowed, sitemap_urls)
+            domain, disallowed, sitemap_urls, max_pages=crawl_limit)
+        # career pages only for smart/deep (quick stays minimal)
         career_emails, career_stats, career_email_urls = (
             harvest_career_pages(domain, deadline=time.monotonic() + 25)
-            if _remaining() > 20 else ({}, {"career_pages_fetched": 0,
-                                            "emails_found": 0, "skipped": True}, {}))
+            if _remaining() > 20 and mode != "quick"
+            else ({}, {"career_pages_fetched": 0,
+                       "emails_found": 0, "skipped": True}, {}))
     else:
         disallowed, robots_sitemaps = [], []
         sitemap_urls = []
@@ -1540,6 +1833,7 @@ def process_domain_search(domain: str, scan_id: int, deep: bool = False,
         career_emails, career_stats, career_email_urls = {}, {"career_pages_fetched": 0,
                                                               "emails_found": 0, "skipped": True}, {}
     timings["crawl"] = int((time.time() - t0) * 1000)
+    _emit("Website crawl", 18, {"emails": sorted(crawled_emails)[:10]})
 
     # 3) Public documents (PDF/DOCX/XLSX/TXT...) — skip when budget is tight
     t0 = time.time()
@@ -1561,14 +1855,28 @@ def process_domain_search(domain: str, scan_id: int, deep: bool = False,
                                                           "emails_found": 0, "skipped": True}, {})
     timings["ocr"] = int((time.time() - t0) * 1000)
 
-    # 4) Subdomain enumeration + crawl of active hosts
+    # 4a) Certificate Transparency (crt.sh) — extra subdomains (smart & deep)
+    t0 = time.time()
+    if "ct" in enabled and _remaining() > 10:
+        ct_subs, ct_stats = search_crtsh(domain)
+    else:
+        ct_subs, ct_stats = [], {"requests": 0, "certs_found": 0, "names_found": 0, "skipped": True}
+    timings["ct"] = int((time.time() - t0) * 1000)
+
+    # 4) Subdomain enumeration + crawl of active hosts (+ CT subdomains)
     t0 = time.time()
     if "subdomains" in enabled and _remaining() > 20:
         subdomains = enumerate_subdomains(domain)
+        for s in ct_subs:
+            if s not in subdomains:
+                subdomains.append(s)
+        subdomains.sort()
         sub_emails, sub_stats, sub_email_urls = crawl_subdomains(subdomains, domain)
     else:
-        subdomains, sub_emails, sub_stats, sub_email_urls = [], {}, {"subdomains_crawled": 0, "skipped": True}, {}
+        subdomains = list(ct_subs)
+        sub_emails, sub_stats, sub_email_urls = {}, {"subdomains_crawled": 0, "skipped": True}, {}
     timings["subdomains"] = int((time.time() - t0) * 1000)
+    _emit("Subdomains + CT", 35, {"subdomains": subdomains[:10]})
 
     # 5) WHOIS lookup
     t0 = time.time()
@@ -1576,14 +1884,18 @@ def process_domain_search(domain: str, scan_id: int, deep: bool = False,
              else None)
     timings["whois"] = int((time.time() - t0) * 1000)
 
-    # 6) Search-engine layer (multi-query)
+    # 6) Search-engine layer (multi-query) — DDG & Bing run in parallel
     t0 = time.time()
     if "search" in enabled and _remaining() > 10:
-        ddg = search_duckduckgo(domain)
-        bing = search_bing(domain)
+        with ThreadPoolExecutor(max_workers=2) as ex:
+            f_ddg = ex.submit(search_duckduckgo, domain)
+            f_bing = ex.submit(search_bing, domain)
+            ddg = f_ddg.result()
+            bing = f_bing.result()
     else:
         ddg, bing = {"emails": [], "results": 0}, {"emails": [], "results": 0}
     timings["search"] = int((time.time() - t0) * 1000)
+    _emit("Search engines", 45)
 
     # 6b) Wayback Machine — historical pages often still carry the emails
     #     Google indexes but the live site removed/obfuscated.
@@ -1595,6 +1907,7 @@ def process_domain_search(domain: str, scan_id: int, deep: bool = False,
         wayback_emails, wayback_stats, wayback_email_urls = {}, {"pages_found": 0, "pages_fetched": 0,
                                                                  "emails_found": 0, "skipped": True}, {}
     timings["wayback"] = int((time.time() - t0) * 1000)
+    _emit("Wayback archive", 55)
 
     # 6c) GitHub commit harvesting — emails in public git histories
     t0 = time.time()
@@ -1604,6 +1917,7 @@ def process_domain_search(domain: str, scan_id: int, deep: bool = False,
         gh_people, gh_stats = {}, {"requests": 0, "commits_found": 0,
                                    "emails_found": 0, "skipped": True}
     timings["github"] = int((time.time() - t0) * 1000)
+    _emit("GitHub commits", 60)
 
     # 6d) Public mailing-list archives (mail-archive.com + marc.info)
     t0 = time.time()
@@ -1613,11 +1927,12 @@ def process_domain_search(domain: str, scan_id: int, deep: bool = False,
         ml_people, ml_stats = {}, {"sources": 0, "messages": 0,
                                    "emails_found": 0, "skipped": True}
     timings["mailing"] = int((time.time() - t0) * 1000)
+    _emit("Mailing lists", 62)
 
     # 6e) Deep OSINT tools — BBOT email-enum (deep mode only, self-hosted)
     deep_osint = {"bbot": {"ran": False}, "holehe": {"checked": 0, "results": {}}}
     bbot_emails: set = set()
-    if deep and settings.DEEP_TOOLS_ENABLED:
+    if mode == "deep" and settings.DEEP_TOOLS_ENABLED:
         t0 = time.time()
         if _remaining() > 40:
             bbot_emails, bbot_subs, bbot_stats = bbot_enum(
@@ -1630,6 +1945,7 @@ def process_domain_search(domain: str, scan_id: int, deep: bool = False,
             timings["bbot"] = int((time.time() - t0) * 1000)
         else:
             deep_osint["bbot"]["message"] = "Scan budget exhausted — BBOT skipped."
+        _emit("BBOT email-enum", 68)
 
     # Raw-vs-valid split for the UI: BBOT's raw count includes addresses from
     # other domains; only valid @target-domain addresses reach the report.
@@ -1637,11 +1953,40 @@ def process_domain_search(domain: str, scan_id: int, deep: bool = False,
     deep_osint["bbot"]["emails_valid"] = bbot_valid
     deep_osint["bbot"]["emails_external"] = max(len(bbot_emails) - bbot_valid, 0)
 
+    # 6f) Job portals (HRD / recruitment emails) — polite & rate-limited.
+    #     Discovery via public search engines; only a few listing pages are
+    #     fetched, so it never looks like scraping to the portals.
+    t0 = time.time()
+    if ("jobportal" in enabled and settings.PORTAL_SCRAPING_ENABLED
+            and _remaining() > 30):
+        portal_deadline = time.monotonic() + min(
+            settings.PORTAL_DOMAIN_MAX_PAGES * 3.0, max(_remaining() - 10, 10))
+        portal_emails, portal_stats, portal_email_urls = (
+            portals_mod.scrape_hrd_for_domain(
+                domain, deadline=portal_deadline,
+                max_pages=settings.PORTAL_DOMAIN_MAX_PAGES))
+    else:
+        portal_emails, portal_stats, portal_email_urls = (
+            {}, {"listings_found": 0, "pages_fetched": 0,
+                 "emails_found": 0, "skipped": True}, {})
+    timings["jobportal"] = int((time.time() - t0) * 1000)
+    _emit("Job portals", 72)
+
+    # 6g) Technology detection (deep mode only) — self-built fingerprinting
+    t0 = time.time()
+    if "tech" in enabled and _remaining() > 10:
+        technologies, tech_stats = detect_technologies(domain)
+    else:
+        technologies, tech_stats = [], {"scanned": False, "found": 0, "skipped": True}
+    timings["tech"] = int((time.time() - t0) * 1000)
+
     # 7) Merge observed emails (website/mailto/security.txt/docs/subdomain/whois/search)
     observed_map: dict = {}
     for email, source in crawled_emails.items():
         observed_map.setdefault(email, source)
     for email, source in career_emails.items():
+        observed_map.setdefault(email, source)
+    for email, source in portal_emails.items():
         observed_map.setdefault(email, source)
     for email, source in doc_emails.items():
         observed_map.setdefault(email, source)
@@ -1674,9 +2019,9 @@ def process_domain_search(domain: str, scan_id: int, deep: bool = False,
 
     # Track the public URL where each observed email was found (redirect icon).
     email_urls: dict = {}
-    for mapping in (crawled_email_urls, career_email_urls, doc_email_urls,
-                    ocr_email_urls, wayback_email_urls, sub_email_urls,
-                    security_txt_urls):
+    for mapping in (crawled_email_urls, career_email_urls, portal_email_urls,
+                    doc_email_urls, ocr_email_urls, wayback_email_urls,
+                    sub_email_urls, security_txt_urls):
         for e, u in mapping.items():
             if u:
                 email_urls.setdefault(e, u)
@@ -1695,7 +2040,8 @@ def process_domain_search(domain: str, scan_id: int, deep: bool = False,
 
     email_list = [
         {"email": e, "source": src, "verified": True,
-         "url": email_urls.get(e, "")}
+         "url": email_urls.get(e, ""),
+         "confidence": SOURCE_CONFIDENCE.get(src, 60)}
         for e, src in sorted(observed_map.items(),
                              key=lambda kv: (SOURCE_PRIORITY.get(kv[1], 9), kv[0]))
     ]
@@ -1723,6 +2069,9 @@ def process_domain_search(domain: str, scan_id: int, deep: bool = False,
                      "message": "Verifikasi SMTP dimatikan (sumber tidak dipilih)."}
     for e in email_list:
         e["smtp"] = smtp_status.get(e["email"], "unchecked")
+        # SMTP 'ok' is the strongest signal — 100% confidence, beats source.
+        if e["smtp"] == "ok":
+            e["confidence"] = SMTP_CONFIDENCE_OK
 
     # 9) Pattern candidates — ONLY included when SMTP-verified as active.
     #    No MX / unreachable MX / catch-all / anti-enumeration → no patterns
@@ -1764,6 +2113,7 @@ def process_domain_search(domain: str, scan_id: int, deep: bool = False,
         email_list.append({
             "email": email, "source": "pattern_verified",
             "verified": True, "smtp": "ok",
+            "confidence": SMTP_CONFIDENCE_OK,
         })
 
     # sort: confirmed-active first, rejected last
@@ -1771,7 +2121,7 @@ def process_domain_search(domain: str, scan_id: int, deep: bool = False,
     email_list.sort(key=lambda e: smtp_rank.get(e["smtp"], 1))
 
     # 9b) Holehe — account footprint for the top-found emails (deep mode)
-    if deep and settings.DEEP_TOOLS_ENABLED and email_list:
+    if mode == "deep" and settings.DEEP_TOOLS_ENABLED and email_list:
         t0 = time.time()
         to_check = [e["email"] for e in email_list[:MAX_HOLEHE_EMAILS]]
         # per-email budget derived from remaining time so we never overshoot
@@ -1839,10 +2189,12 @@ def process_domain_search(domain: str, scan_id: int, deep: bool = False,
             "dns_records": dns_records,
             "spf": spf,
             "dmarc": dmarc,
+            "dkim": dkim,
             "security_posture": {
                 "mx": bool(mx_count),
                 "spf": bool(spf),
                 "dmarc": bool(dmarc),
+                "dkim": bool(dkim),
             },
             "security_txt": {
                 "found": security_found,
@@ -1852,6 +2204,9 @@ def process_domain_search(domain: str, scan_id: int, deep: bool = False,
             "doc_stats": doc_stats,
             "ocr_stats": ocr_stats,
             "wayback_stats": wayback_stats,
+            "ct_stats": ct_stats,
+            "technologies": technologies,
+            "tech_stats": tech_stats,
             "subdomains": subdomains,
             "subdomain_stats": sub_stats,
             "whois": whois,
@@ -1862,9 +2217,11 @@ def process_domain_search(domain: str, scan_id: int, deep: bool = False,
             "github_stats": gh_stats,
             "mailing_stats": ml_stats,
             "career_stats": career_stats,
+            "jobportal_stats": portal_stats,
             "people": people_list,
             "deep_osint": deep_osint,
             "confidence_score": score,
             "timings": timings,
         },
+        "mode": mode,
     }

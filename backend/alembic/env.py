@@ -7,7 +7,7 @@ from alembic import context
 
 # Import models for autogenerate support
 from app.db.session import Base
-from app.models import user, api_key, webhook, scan, domain, email, username, dns_record, certificate, technology, worker, audit_log, api_key_usage, notification, vire_atlas
+import app.models  # noqa: F401 — registers every model on Base.metadata
 
 # this is the Alembic Config object, which provides
 # access to the values within the .ini file in use.

@@ -51,6 +51,14 @@ class Settings(BaseSettings):
     # GitHub API token (optional) — raises rate limits for commit harvesting
     GITHUB_TOKEN: Optional[str] = None
 
+    # Job portal scraping (HRD emails) — polite, rate-limited, ban-averse.
+    PORTAL_SCRAPING_ENABLED: bool = True
+    PORTAL_MIN_DELAY: float = 2.0   # min seconds between requests to the same host
+    PORTAL_JITTER: float = 2.5      # extra random delay (0..jitter) per request
+    PORTAL_HOST_CAP: int = 40       # max requests per host per scan
+    PORTAL_MAX_PAGES: int = 20      # bulk mode page cap
+    PORTAL_DOMAIN_MAX_PAGES: int = 8  # per-domain scan page cap
+
     model_config = SettingsConfigDict(
         env_file=ROOT_DIR / ".env",
         env_file_encoding="utf-8",

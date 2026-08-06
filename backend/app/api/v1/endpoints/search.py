@@ -1,10 +1,8 @@
 from fastapi import APIRouter
-from sqlalchemy.exc import IntegrityError
-from sqlalchemy.sql import func
 from celery.exceptions import TimeoutError as CeleryTimeoutError
-from app.tasks.domain_tasks import DEFAULT_SOURCES, SOURCE_KEYS, process_domain_search
-from app.db.session import SessionLocal
-from app.models.vire_atlas import VireAtlas
+from app.tasks.domain_tasks import DEFAULT_SOURCES, MODE_SOURCES, SOURCE_KEYS, process_domain_search
+from app.tasks.portals import search_job_portals
+from app.services import atlas_service
 from pydantic import BaseModel, Field, field_validator
 
 router = APIRouter()
@@ -12,9 +10,16 @@ router = APIRouter()
 
 class DomainSearchRequest(BaseModel):
     domain: str
-    deep: bool = False  # Deep OSINT mode: also runs BBOT + Holehe (slower)
-    force: bool = False  # Skip the VIRE Atlas cache and re-scan from scratch
+    mode: str = "smart"  # quick | smart | deep — validated below against MODE_SOURCES
+    deep: bool = False  # legacy alias: deep=True forces mode="deep" (BBOT + Holehe)
+    force: bool = False  # Skip the Atlas cache and re-scan from scratch
     sources: list[str] = Field(default_factory=lambda: list(DEFAULT_SOURCES))
+
+    @field_validator("mode")
+    @classmethod
+    def clean_mode(cls, v: str) -> str:
+        v = (v or "smart").strip().lower()
+        return v if v in MODE_SOURCES else "smart"
 
     @field_validator("domain")
     @classmethod
@@ -36,100 +41,44 @@ class DomainSearchRequest(BaseModel):
         return cleaned or list(DEFAULT_SOURCES)
 
 
-def _lookup_atlas(domain: str, mode: str):
-    """Return the cached row for (domain, mode) or None. Opens + closes its own
-    short-lived session so no DB connection is held during a long scan."""
-    db = SessionLocal()
-    try:
-        return (
-            db.query(VireAtlas)
-            .filter(VireAtlas.domain == domain, VireAtlas.scan_mode == mode)
-            .first()
-        )
-    finally:
-        db.close()
+class JobPortalSearchRequest(BaseModel):
+    keyword: str = Field(..., min_length=2, max_length=80)
+    location: str = Field(default="", max_length=80)
+    max_pages: int = Field(default=20, ge=5, le=60)
 
+    @field_validator("keyword")
+    @classmethod
+    def clean_keyword(cls, v: str) -> str:
+        return (v or "").strip()
 
-def _save_atlas(domain: str, mode: str, result: dict) -> None:
-    """Upsert a completed scan result into the atlas. Best-effort — never raise."""
-    db = SessionLocal()
-    try:
-        row = (
-            db.query(VireAtlas)
-            .filter(VireAtlas.domain == domain, VireAtlas.scan_mode == mode)
-            .first()
-        )
-        emails_found = 0
-        try:
-            emails_found = len(result["results"].get("emails") or [])
-        except Exception:
-            pass
-        now = func.now()
-        if row:
-            row.result = result
-            row.emails_found = emails_found
-            row.status = "completed"
-            row.scanned_at = now
-        else:
-            db.add(VireAtlas(
-                domain=domain,
-                scan_mode=mode,
-                result=result,
-                emails_found=emails_found,
-                status="completed",
-                hits=0,
-                scanned_at=now,
-            ))
-        try:
-            db.commit()
-        except IntegrityError:
-            # Concurrent scan for the same domain won the race — update instead.
-            db.rollback()
-            row = (
-                db.query(VireAtlas)
-                .filter(VireAtlas.domain == domain, VireAtlas.scan_mode == mode)
-                .first()
-            )
-            if row:
-                row.result = result
-                row.emails_found = emails_found
-                row.status = "completed"
-                row.scanned_at = func.now()
-                db.commit()
-    except Exception:
-        db.rollback()  # cache write is best-effort — never fail the scan
-    finally:
-        db.close()
+    @field_validator("location")
+    @classmethod
+    def clean_location(cls, v: str) -> str:
+        return (v or "").strip()
 
 
 @router.post("/domain")
 def search_domain(request: DomainSearchRequest):
-    mode = "deep" if request.deep else "standard"
+    mode = "deep" if request.deep else request.mode
 
-    # ---- VIRE Atlas: serve a cached result instead of a full re-scan ----
-    cached = _lookup_atlas(request.domain, mode)
-    if cached is not None and not request.force and cached.result is not None:
-        db = SessionLocal()
-        try:
-            db.query(VireAtlas).filter(VireAtlas.id == cached.id).update(
-                {VireAtlas.hits: (cached.hits or 0) + 1}
-            )
-            db.commit()
-        except Exception:
-            db.rollback()
-        finally:
-            db.close()
-        payload = dict(cached.result)
+    # ---- Atlas knowledge base: serve the latest cached scan instead of a
+    #      full re-scan (reads the most recent AtlasHistory snapshot) ----
+    cached = None
+    if not request.force:
+        cached = atlas_service.lookup_cached(request.domain, mode)
+    if cached is not None:
+        payload, scanned_at, hits = cached
+        payload = dict(payload)
         payload["from_cache"] = True
         payload["cached_at"] = (
-            cached.scanned_at or cached.created_at
-        ).isoformat()
-        payload["cached_hits"] = (cached.hits or 0) + 1
+            scanned_at.isoformat() if scanned_at is not None else None
+        )
+        payload["cached_hits"] = hits
         return payload
 
     try:
         task = process_domain_search.delay(
-            request.domain, scan_id=1, deep=request.deep,
+            request.domain, scan_id=1, mode=mode,
             sources=request.sources)
     except Exception as e:
         return {
@@ -170,9 +119,54 @@ def search_domain(request: DomainSearchRequest):
             "message": "Pencarian masih berjalan di background. Coba lagi dalam beberapa detik.",
         }
 
-    # ---- VIRE Atlas: persist the fresh result for future fast lookups ----
+    # ---- Atlas knowledge base: persist the fresh result (best-effort) ----
     if result.get("status") == "completed":
-        _save_atlas(request.domain, mode, result)
+        atlas_service.save_scan_result(request.domain, mode, result)
 
     result["from_cache"] = False
+    return result
+
+
+@router.post("/jobportal")
+def search_job_portal(request: JobPortalSearchRequest):
+    """HRD Hunter — bulk HRD/recruitment email discovery from job portals.
+
+    Polite, rate-limited scraping: discovery via public search engines
+    (site: dorks), a bounded set of listing pages fetched with per-host
+    delays, robots.txt honored, LinkedIn skipped. No portal is hammered.
+    """
+    try:
+        task = search_job_portals.delay(
+            keyword=request.keyword,
+            location=request.location,
+            max_pages=request.max_pages,
+        )
+    except Exception as e:
+        return {
+            "status": "error",
+            "message": "Worker queue tidak tersedia. Pastikan Redis & Celery berjalan.",
+            "error": str(e),
+        }
+
+    try:
+        result = task.get(timeout=300)
+    except CeleryTimeoutError:
+        return {
+            "status": "processing",
+            "task_id": task.id,
+            "message": "Pencarian masih berjalan di background. Coba lagi dalam beberapa detik.",
+        }
+    except Exception as e:
+        return {
+            "status": "error",
+            "task_id": task.id,
+            "message": "Pencarian gagal diproses oleh worker.",
+            "error": str(e),
+        }
+    if result is None:
+        return {
+            "status": "processing",
+            "task_id": task.id,
+            "message": "Pencarian masih berjalan di background. Coba lagi dalam beberapa detik.",
+        }
     return result

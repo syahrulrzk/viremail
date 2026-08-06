@@ -49,9 +49,15 @@ SMTP verification — so the tool stays free, transparent and audit-friendly.
 - **Search engines** — DuckDuckGo + Bing, multi-query dorks
 - **Wayback Machine** — archived pages often still leak what the live site removed
 - **GitHub commit harvesting** & **mailing-list archives** → people/contacts
+- **Job portal HRD emails** — polite, ban-averse scraping of public job
+  portals (Karir.com, JobStreet, Kalibrr, Glints, …) via search-engine
+  discovery; HRD/recruitment addresses are flagged automatically
 - **SMTP verification** — RCPT TO probe (**no mail is ever sent**), with
   catch-all & anti-enumeration detection
 - **Pattern emails** (info@, admin@, …) — only shown when SMTP-verified as active
+- **Parallel scan engine** — web crawl, search engines, Wayback, documents,
+  subdomain crawl & SMTP probes all run concurrently (connection-reuse
+  sessions), cutting per-domain scan time dramatically
 
 ### 🌐 Domain Intelligence
 - DNS records: A / AAAA / MX / NS / TXT
@@ -61,6 +67,17 @@ SMTP verification — so the tool stays free, transparent and audit-friendly.
 ### 🧬 Deep OSINT (optional mode)
 - **BBOT** — `email-enum` preset (crt, pgp, securitytxt, sslcert, …), self-hosted
 - **Holehe** — check where a found email is registered (~120 platforms)
+
+### 🧠 VIRE Atlas — Knowledge Graph
+- Scan results are no longer a single JSON blob — they are normalized into a
+  **knowledge model**: `atlas_domains`, `atlas_emails`, `atlas_sources`,
+  `atlas_relationships` (graph edges: who → email → source), subdomains, DNS,
+  certificates, documents, technologies, history & more
+- Every entity has its own lifecycle (`first_seen` / `last_seen`) and can be
+  updated independently; scans and the knowledge base are fully separated
+- **Scan** (process) vs **Atlas** (intelligence) — jobs, progress, tasks & results
+  live in `models/scan/` + `models/worker/`, the normalized knowledge in
+  `models/atlas/`
 
 ### 🛡️ Built-in Safety
 - **SSRF guard** on every HTTP fetch — private/loopback/cloud-metadata hosts are
@@ -106,8 +123,17 @@ viremail/
 │   │   ├── api/v1/endpoints/     # REST endpoints (search, auth, apikeys, webhooks)
 │   │   ├── core/                 # config, celery app
 │   │   ├── db/                   # SQLAlchemy session
-│   │   ├── models/               # database models
-│   │   └── tasks/                # domain_tasks.py — the recon engine 🧠
+│   │   ├── models/               # database models — organized by domain
+│   │   │   ├── auth/             #   user, organization, team, api_key, audit_log…
+│   │   │   ├── scan/             #   scan, scan_job, scan_task, scan_progress…
+│   │   │   ├── worker/           #   worker, worker_job, worker_queue, worker_log
+│   │   │   ├── atlas/            #   🧠 knowledge graph (12 tables)
+│   │   │   │                     #   domain, email, source, relationship, subdomain…
+│   │   │   └── source.py         #   connector registry (17 seeded sources)
+│   │   ├── services/             # atlas_service.py — writes/reads the knowledge base
+│   │   └── tasks/                # recon engine 🧠
+│   │       ├── domain_tasks.py   #   domain scan (parallel, all source connectors)
+│   │       └── portals.py        #   job-portal HRD hunting (polite scraping)
 │   ├── alembic/                  # database migrations
 │   ├── main.py                   # FastAPI entrypoint
 │   └── requirements.txt
@@ -122,10 +148,11 @@ viremail/
 └── prd.md                        # product requirements & roadmap
 ```
 
-The heart of the tool is `backend/app/tasks/domain_tasks.py` — a single,
-well-commented module with all self-built source connectors (DNS, crawl,
-documents, OCR, WHOIS, search, wayback, SMTP, …). Great starting point for
-contributors.
+The heart of the tool is `backend/app/tasks/` — `domain_tasks.py` (all
+self-built domain connectors: DNS, crawl, documents, OCR, WHOIS, search,
+wayback, SMTP, …) and `portals.py` (polite job-portal HRD hunting). Scan
+results are persisted to the VIRE Atlas knowledge graph via
+`app/services/atlas_service.py`. Great starting point for contributors.
 
 ---
 
@@ -186,20 +213,41 @@ Open the dashboard and scan your first domain 🎉.
 ```bash
 curl -X POST http://localhost:8000/api/v1/search/domain \
   -H 'Content-Type: application/json' \
-  -d '{"domain": "example.com"}'
+  -d '{"domain": "example.com", "mode": "deep"}'
 ```
 
 | Field     | Type    | Description                                            |
 |-----------|---------|--------------------------------------------------------|
 | `domain`  | string  | **required** — the domain to scan (e.g. `example.com`) |
-| `deep`    | boolean | optional — also run BBOT + Holehe (slower, ~2–5 min)   |
+| `mode`    | string  | `quick` \| `smart` \| `deep` (default `smart`) — engine subset & time budget |
+| `deep`    | boolean | legacy alias — `true` forces `mode="deep"` (BBOT + Holehe) |
+| `force`   | boolean | skip the Atlas cache and re-scan from scratch           |
 | `sources` | array   | optional — subset of engines, e.g. `["dns","smtp"]`    |
 
 The response includes `emails` (with source & SMTP status), `email_stats`,
 `smtp_check`, `dns_records`, `spf`, `dmarc`, `security_posture`,
 `security_txt`, `crawl_stats`, `doc_stats`, `ocr_stats`, `subdomains`,
-`whois`, `people`, `deep_osint`, `search_stats`, `confidence_score` and
-`timings`.
+`whois`, `people`, `jobportal_stats`, `deep_osint`, `search_stats`,
+`confidence_score` and `timings`.
+
+### `POST /api/v1/search/jobportal` — HRD Hunter (bulk)
+
+Hunt HRD / recruitment emails across public job portals for many companies at
+once. Discovery is done via public search-engine dorks, fetches are
+rate-limited per host with jitter, `robots.txt` is honored and LinkedIn is
+never fetched directly (anti-bot) — designed to be ban-averse.
+
+```bash
+curl -X POST http://localhost:8000/api/v1/search/jobportal \
+  -H 'Content-Type: application/json' \
+  -d '{"keyword": "software engineer", "location": "jakarta"}'
+```
+
+| Field      | Type    | Description                                   |
+|------------|---------|-----------------------------------------------|
+| `keyword`  | string  | **required** — job / company keyword          |
+| `location` | string  | optional city / region filter                 |
+| `max_pages`| integer | listing pages to check (5–60, default 20)     |
 
 Interactive docs: `http://localhost:8000/docs` (Swagger UI).
 
@@ -218,6 +266,10 @@ All backend settings live in `.env` (see [`example.env`](example.env)):
 | `SMTP_VERIFY_ENABLED`      | `true`                         | Toggle SMTP RCPT-TO verification         |
 | `OCR_ENABLED`              | `true`                         | Toggle local Tesseract OCR               |
 | `DEEP_TOOLS_ENABLED`       | `true`                         | Toggle BBOT + Holehe (deep mode)         |
+| `PORTAL_SCRAPING_ENABLED`  | `true`                         | Toggle job-portal HRD scraping           |
+| `PORTAL_MIN_DELAY`         | `2.0`                          | Min seconds between requests to the same host |
+| `PORTAL_JITTER`            | `2.5`                          | Extra random delay (0..jitter) per request  |
+| `PORTAL_HOST_CAP`          | `40`                           | Max requests per host per scan           |
 | `BACKEND_CORS_ORIGINS`     | localhost + LAN list           | JSON list of allowed frontend origins    |
 
 Frontend: `NEXT_PUBLIC_API_URL` (defaults to `http://localhost:8000/api/v1`).
@@ -245,6 +297,9 @@ take longer.
 - ✅ Subdomain enumeration + WHOIS lookup
 - ✅ Multi-engine search scraping (DuckDuckGo + Bing) + Wayback Machine
 - ✅ Deep OSINT mode (BBOT + Holehe)
+- ✅ Job-portal HRD email hunting (polite, ban-averse scraping)
+- ✅ Parallel scan engine (crawl, search, wayback, docs, SMTP run concurrently)
+- ✅ VIRE Atlas knowledge graph (scan ⇄ knowledge separated, graph edges)
 - ⏳ Real authentication (JWT) & user dashboards
 - ⏳ Certificate transparency / TLS certificate analysis / RDAP
 - ⏳ Website technology detection & ASN lookup

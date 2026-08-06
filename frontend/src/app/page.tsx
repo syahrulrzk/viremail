@@ -34,6 +34,7 @@ import {
   ExternalLink,
   FileSpreadsheet,
   FileDown,
+  Handshake,
   type LucideIcon,
 } from "lucide-react";
 import Image from "next/image";
@@ -56,23 +57,50 @@ const SCAN_STEPS = [
 
 const SCAN_MODES: { value: string; label: string; desc: string; icon: LucideIcon }[] = [
   {
-    value: "standard",
-    label: "Standard scan",
-    desc: "All 11 engines · fast baseline",
+    value: "quick",
+    label: "Atlas Quick",
+    desc: "<10s · DNS + DKIM + homepage/contact",
     icon: Zap,
   },
   {
+    value: "smart",
+    label: "Atlas Smart",
+    desc: "30–60s · default · docs + CT + subdomains",
+    icon: Crosshair,
+  },
+  {
     value: "deep",
-    label: "Deep OSINT",
-    desc: "BBOT + Holehe · ~2–5 min extra",
+    label: "Atlas Deep",
+    desc: "2–10min · search, wayback, GitHub, OCR, job portals, BBOT",
     icon: Sparkles,
   },
 ];
+
+// Mode -> source list shown in the scan console footer
+const MODE_ENGINES: Record<string, string> = {
+  quick: "dns · web",
+  smart: "dns · web · docs · subdomains · whois · ct · patterns · smtp",
+  deep: "dns · web · docs · subdomains · whois · ct · patterns · smtp · search · wayback · github · mailing · ocr · jobportal · tech",
+};
+
+const MODE_ENGINE_COUNT: Record<string, number> = {
+  quick: 2,
+  smart: 8,
+  deep: 15,
+};
+
+// Atlas freshness badge config
+const FRESHNESS_META: Record<string, { label: string; cls: string; dot: string }> = {
+  fresh: { label: "Atlas · fresh", cls: "bg-emerald-500/10 text-emerald-400 border-emerald-500/40", dot: "bg-emerald-400" },
+  warm: { label: "Atlas · warm", cls: "bg-amber-500/10 text-amber-300 border-amber-500/40", dot: "bg-amber-400" },
+  stale: { label: "Atlas · stale", cls: "bg-red-500/10 text-red-400 border-red-500/40", dot: "bg-red-400" },
+};
 
 const SOURCE_META: Record<string, { label: string; cls: string; icon: LucideIcon }> = {
   website: { label: "Website", cls: "bg-emerald-500/10 text-emerald-400 border-emerald-500/30", icon: Globe },
   mailto: { label: "mailto", cls: "bg-emerald-500/10 text-emerald-400 border-emerald-500/30", icon: Mail },
   careers: { label: "Careers", cls: "bg-amber-500/10 text-amber-400 border-amber-500/30", icon: Briefcase },
+  jobportal: { label: "Job Portal", cls: "bg-rose-500/10 text-rose-400 border-rose-500/30", icon: Handshake },
   github: { label: "GitHub", cls: "bg-zinc-400/10 text-zinc-300 border-zinc-400/30", icon: GitBranch },
   mailing_list: { label: "Mailing List", cls: "bg-indigo-500/10 text-indigo-400 border-indigo-500/30", icon: MailOpen },
   security_txt: { label: "security.txt", cls: "bg-amber-500/10 text-amber-400 border-amber-500/30", icon: Shield },
@@ -98,6 +126,7 @@ interface EmailResult {
   verified: boolean;
   smtp?: "ok" | "rejected" | "unknown" | "unchecked";
   url?: string;
+  confidence?: number;
 }
 
 interface Person {
@@ -118,6 +147,8 @@ interface ScanResult {
   from_cache?: boolean;
   cached_at?: string;
   cached_hits?: number;
+  freshness?: "fresh" | "warm" | "stale";
+  mode?: string;
   results?: {
     emails: EmailResult[];
     email_stats: {
@@ -138,8 +169,18 @@ interface ScanResult {
     dns_records: Record<string, string[]>;
     spf: string | null;
     dmarc: string | null;
-    security_posture: { mx: boolean; spf: boolean; dmarc: boolean };
+    dkim?: { selector?: string; record?: string } | null;
+    security_posture: { mx: boolean; spf: boolean; dmarc: boolean; dkim?: boolean };
     security_txt: { found: boolean; contacts: string[] };
+    ct_stats?: {
+      requests?: number;
+      certs_found?: number;
+      names_found?: number;
+      message?: string;
+      skipped?: boolean;
+    };
+    technologies?: { name: string; category: string; evidence: string }[];
+    tech_stats?: { scanned?: boolean; found?: number; message?: string; skipped?: boolean };
     crawl_stats: { pages_crawled: number; links_found: number; max_depth?: number };
     doc_stats: { docs_found?: number; docs_parsed?: number; emails_found?: number };
     ocr_stats?: {
@@ -172,6 +213,14 @@ interface ScanResult {
       message?: string;
     };
     career_stats?: { career_pages_fetched?: number; emails_found?: number };
+    jobportal_stats?: {
+      portals_queried?: number;
+      listings_found?: number;
+      pages_fetched?: number;
+      emails_found?: number;
+      message?: string;
+      skipped?: boolean;
+    };
     deep_osint?: {
       bbot: {
         ran?: boolean;
@@ -237,7 +286,10 @@ export default function Home() {
   const [step, setStep] = useState(0);
   const [elapsed, setElapsed] = useState(0);
   const [copied, setCopied] = useState<string | null>(null);
-  const [deep, setDeep] = useState(false);
+  const [scanMode, setScanMode] = useState<"quick" | "smart" | "deep">("smart");
+  const [liveStage, setLiveStage] = useState("");
+  const [livePercent, setLivePercent] = useState(0);
+  const [liveEmails, setLiveEmails] = useState<EmailResult[]>([]);
   const [recent, setRecent] = useState<RecentSearch[]>([]);
   const [openDns, setOpenDns] = useState(true);
   const [openEmails, setOpenEmails] = useState(true);
@@ -348,34 +400,83 @@ export default function Home() {
     setQuery(cleaned);
     setStep(0);
     setElapsed(0);
+    setLiveStage("");
+    setLivePercent(0);
+    setLiveEmails([]);
     saveRecent(cleaned);
 
     try {
       const res = await fetch(`${API_BASE}/search/domain`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ domain: cleaned, deep, force }),
+        body: JSON.stringify({ domain: cleaned, mode: scanMode, force }),
       });
       const data = await res.json();
       if (!res.ok) {
-        // Surface backend validation/errors (e.g. 422) instead of a blank screen
         const detail = data?.detail;
         setError(
           typeof detail === "string"
             ? detail
             : `Backend error (HTTP ${res.status})`
         );
+        setLoading(false);
         return;
       }
-      setResult(data);
-      setTimeout(() => {
-        resultsRef.current?.scrollIntoView({ behavior: "smooth", block: "start" });
-      }, 150);
+
+      // Fast path: VIRE Atlas cache hit -> result comes back immediately.
+      if (data.status !== "processing" || !data.task_id) {
+        setResult(data);
+        setLoading(false);
+        setTimeout(() => {
+          resultsRef.current?.scrollIntoView({ behavior: "smooth", block: "start" });
+        }, 150);
+        return;
+      }
+
+      // Streaming path: open SSE and update the UI as stages complete.
+      const es = new EventSource(`${API_BASE}/search/stream/${data.task_id}`);
+      es.onmessage = (ev) => {
+        const msg = JSON.parse(ev.data || "{}");
+        if (msg.type === "progress") {
+          if (msg.stage) setLiveStage(msg.stage);
+          if (typeof msg.percent === "number") setLivePercent(msg.percent);
+          const partial = msg.partial;
+          if (partial?.emails?.length) {
+            setLiveEmails(
+              partial.emails.map((e: string) => ({
+                email: e,
+                source: "website",
+                verified: true,
+                smtp: "unchecked",
+              }))
+            );
+          }
+        } else if (msg.type === "result") {
+          setResult(msg.payload);
+          setLoading(false);
+          es.close();
+          setTimeout(() => {
+            resultsRef.current?.scrollIntoView({ behavior: "smooth", block: "start" });
+          }, 150);
+        } else if (msg.type === "error") {
+          setError(msg.error || "Scan failed on the backend.");
+          setLoading(false);
+          es.close();
+        }
+      };
+      es.onerror = () => {
+        // Don't kill the loading state on transient network blips; the
+        // browser auto-reconnects EventSource. Only bail after a long silence.
+        es.close();
+        setError(
+          "Streaming interrupted. The scan may still be running — rescan to try again."
+        );
+        setLoading(false);
+      };
     } catch {
       setError(
         "Failed to reach the backend. Make sure the API is running on localhost:8000."
       );
-    } finally {
       setLoading(false);
     }
   };
@@ -429,8 +530,13 @@ export default function Home() {
     message?: string;
   } = r?.smtp_check ?? {};
   const dns: Record<string, string[]> = r?.dns_records ?? {};
-  const posture: { mx?: boolean; spf?: boolean; dmarc?: boolean } =
+  const posture: { mx?: boolean; spf?: boolean; dmarc?: boolean; dkim?: boolean } =
     r?.security_posture ?? {};
+  const dkim = r?.dkim ?? null;
+  const technologies: { name: string; category: string; evidence: string }[] =
+    r?.technologies ?? [];
+  const techStats = r?.tech_stats ?? {};
+  const ctStats = r?.ct_stats ?? {};
   const hasMx = !!posture.mx;
   const score: number = r?.confidence_score ?? 0;
   const timings: Record<string, number> = r?.timings ?? {};
@@ -454,6 +560,7 @@ export default function Home() {
   const githubStats = r?.github_stats ?? {};
   const mailingStats = r?.mailing_stats ?? {};
   const careerStats = r?.career_stats ?? {};
+  const jobportalStats = r?.jobportal_stats ?? {};
   const ocrStats: {
     enabled?: boolean;
     images_found?: number;
@@ -564,9 +671,11 @@ export default function Home() {
           >
             <div
               className={`group relative rounded-2xl border bg-card/70 backdrop-blur-xl shadow-2xl shadow-black/40 transition-all duration-300 focus-within:border-primary/60 focus-within:ring-4 focus-within:ring-primary/10 animate-scale-in ${
-                deep
+                scanMode === "deep"
                   ? "border-fuchsia-500/50 shadow-fuchsia-500/15"
-                  : "border-border/70 hover:border-primary/40"
+                  : scanMode === "quick"
+                    ? "border-emerald-500/40 shadow-emerald-500/10"
+                    : "border-border/70 hover:border-primary/40"
               }`}
             >
               {/* row 1: target input + scan button */}
@@ -607,18 +716,20 @@ export default function Home() {
               {/* divider */}
               <div className="mx-3 h-px bg-gradient-to-r from-transparent via-border/70 to-transparent" />
 
-              {/* row 2: scan mode dropdown — full-width inside the panel */}
+              {/* row 2: scan mode selector — full-width inside the panel */}
               <div
                 className={`flex items-center justify-between gap-3 px-4 sm:px-5 py-3.5 transition-colors duration-200 ${
-                  deep ? "bg-fuchsia-500/[0.07]" : "hover:bg-white/[0.02]"
+                  scanMode === "deep" ? "bg-fuchsia-500/[0.07]" : "hover:bg-white/[0.02]"
                 }`}
               >
                 <span className="flex items-center gap-2.5 min-w-0">
                   <span
                     className={`w-8 h-8 shrink-0 rounded-lg flex items-center justify-center transition-colors duration-200 ${
-                      deep
+                      scanMode === "deep"
                         ? "bg-fuchsia-500/15 text-fuchsia-300"
-                        : "bg-white/[0.03] text-muted-foreground"
+                        : scanMode === "quick"
+                          ? "bg-emerald-500/15 text-emerald-300"
+                          : "bg-white/[0.03] text-muted-foreground"
                     }`}
                   >
                     <Crosshair className="w-4 h-4" />
@@ -626,15 +737,13 @@ export default function Home() {
                   <span className="min-w-0 text-left">
                     <span
                       className={`block text-xs font-semibold transition-colors duration-200 ${
-                        deep ? "text-fuchsia-300" : "text-foreground/90"
+                        scanMode === "deep" ? "text-fuchsia-300" : "text-foreground/90"
                       }`}
                     >
                       Scan Mode
                     </span>
                     <span className="block text-[11px] text-muted-foreground/70 truncate">
-                      {deep
-                        ? "BBOT + Holehe — deeper, but slower (~2–5 min extra)"
-                        : "All 11 engines — fast baseline"}
+                      {SCAN_MODES.find((m) => m.value === scanMode)?.desc ?? ""}
                     </span>
                   </span>
                 </span>
@@ -647,17 +756,19 @@ export default function Home() {
                     aria-haspopup="listbox"
                     aria-expanded={modeOpen}
                     className={`flex items-center gap-2 rounded-lg border px-3 py-2 text-xs font-semibold transition-all duration-200 ${
-                      deep
+                      scanMode === "deep"
                         ? "border-fuchsia-500/40 bg-fuchsia-500/10 text-fuchsia-300 hover:bg-fuchsia-500/20"
-                        : "border-border/70 bg-black/30 text-foreground hover:border-primary/50"
+                        : scanMode === "quick"
+                          ? "border-emerald-500/40 bg-emerald-500/10 text-emerald-300 hover:bg-emerald-500/20"
+                          : "border-border/70 bg-black/30 text-foreground hover:border-primary/50"
                     }`}
                   >
-                    {deep ? (
-                      <Sparkles className="w-3.5 h-3.5" />
-                    ) : (
-                      <Zap className="w-3.5 h-3.5" />
-                    )}
-                    {deep ? "Deep OSINT" : "Standard"}
+                    {SCAN_MODES.find((m) => m.value === scanMode)?.icon &&
+                      (() => {
+                        const Icon = SCAN_MODES.find((m) => m.value === scanMode)!.icon;
+                        return <Icon className="w-3.5 h-3.5" />;
+                      })()}
+                    {SCAN_MODES.find((m) => m.value === scanMode)?.label ?? "Atlas Smart"}
                     <ChevronDown
                       className={`w-3.5 h-3.5 transition-transform duration-200 ${
                         modeOpen ? "rotate-180" : ""
@@ -666,15 +777,15 @@ export default function Home() {
                   </button>
 
                   {modeOpen && (
-                    <div className="absolute right-0 top-full mt-2 z-30 w-64 rounded-xl border border-border/70 bg-popover shadow-2xl shadow-black/50 overflow-hidden animate-fade-up">
+                    <div className="absolute right-0 top-full mt-2 z-30 w-72 rounded-xl border border-border/70 bg-popover shadow-2xl shadow-black/50 overflow-hidden animate-fade-up">
                       {SCAN_MODES.map((m) => {
-                        const active = m.value === (deep ? "deep" : "standard");
+                        const active = m.value === scanMode;
                         return (
                           <button
                             key={m.value}
                             type="button"
                             onClick={() => {
-                              setDeep(m.value === "deep");
+                              setScanMode(m.value as "quick" | "smart" | "deep");
                               setModeOpen(false);
                             }}
                             className={`w-full flex items-start gap-2.5 px-3.5 py-3 text-left transition-colors ${
@@ -709,29 +820,31 @@ export default function Home() {
                 </div>
               </div>
 
-              {/* row 3: engine list — differentiates standard vs deep mode */}
+              {/* row 3: engine list — per-mode source subset */}
               <div className="px-4 sm:px-5 py-2.5 border-t border-border/40 flex flex-wrap items-center justify-between gap-x-3 gap-y-1 text-[10px] text-muted-foreground/50 font-mono">
                 <span className="flex items-center gap-2 min-w-0">
                   <span className="flex items-center gap-1 shrink-0">
                     <Database className="w-3 h-3 text-primary/70" />
-                    {deep ? 13 : 11} engines
+                    {MODE_ENGINE_COUNT[scanMode] ?? 8} engines
                   </span>
                   <span className="text-muted-foreground/30 shrink-0">·</span>
                   <span className="truncate">
-                    dns · web · docs · ocr · subdomains · whois · search · wayback · github · mailing · smtp
-                    {deep && (
+                    {MODE_ENGINES[scanMode] ?? MODE_ENGINES.smart}
+                    {scanMode === "deep" && (
                       <span className="text-fuchsia-400"> · bbot · holehe</span>
                     )}
                   </span>
                 </span>
                 <span
                   className={`shrink-0 rounded-full border px-2 py-0.5 uppercase tracking-wider ${
-                    deep
+                    scanMode === "deep"
                       ? "border-fuchsia-500/40 bg-fuchsia-500/10 text-fuchsia-300"
-                      : "border-border/50 bg-black/30 text-muted-foreground/60"
+                      : scanMode === "quick"
+                        ? "border-emerald-500/40 bg-emerald-500/10 text-emerald-300"
+                        : "border-border/50 bg-black/30 text-muted-foreground/60"
                   }`}
                 >
-                  {deep ? "deep" : "standard"}
+                  {scanMode}
                 </span>
               </div>
             </div>
@@ -779,7 +892,9 @@ export default function Home() {
               <div className="flex items-center gap-2 px-5 pt-4 pb-2 border-b border-border/50 text-xs text-muted-foreground font-mono">
                 <Terminal className="w-3.5 h-3.5 text-primary" />
                 vire — reconnaissance in progress
-                <span className="ml-auto text-primary">{elapsed}s</span>
+                <span className="ml-auto text-primary">
+                  {liveStage ? `${livePercent}%` : `${elapsed}s`}
+                </span>
               </div>
               <div className="p-5 md:p-6 space-y-3 font-mono text-sm">
                 {SCAN_STEPS.map((s, i) => {
@@ -805,6 +920,46 @@ export default function Home() {
                   );
                 })}
               </div>
+
+              {/* live SSE stage + progress bar */}
+              {liveStage && (
+                <div className="px-5 pb-3">
+                  <div className="flex items-center justify-between text-[10px] text-muted-foreground/70 font-mono mb-1.5">
+                    <span className="truncate flex items-center gap-1.5">
+                      <Activity className="w-3 h-3 text-primary shrink-0" />
+                      {liveStage}
+                    </span>
+                    <span className="text-primary shrink-0">{livePercent}%</span>
+                  </div>
+                  <div className="h-1.5 rounded-full bg-white/[0.06] overflow-hidden">
+                    <div
+                      className="h-full rounded-full bg-gradient-to-r from-primary to-fuchsia-500 transition-all duration-700"
+                      style={{ width: `${Math.min(livePercent, 100)}%` }}
+                    />
+                  </div>
+                </div>
+              )}
+
+              {/* live emails streaming in */}
+              {liveEmails.length > 0 && (
+                <div className="px-5 pb-4">
+                  <div className="text-[10px] text-muted-foreground/70 font-mono mb-1.5 flex items-center gap-1.5">
+                    <Mail className="w-3 h-3 text-emerald-400" />
+                    {liveEmails.length} email{liveEmails.length > 1 ? "s" : ""} found so far
+                  </div>
+                  <div className="flex flex-wrap gap-1.5">
+                    {liveEmails.slice(0, 12).map((e) => (
+                      <span
+                        key={e.email}
+                        className="font-mono text-[10px] border border-emerald-500/30 bg-emerald-500/10 text-emerald-300 rounded-full px-2 py-0.5"
+                      >
+                        {e.email}
+                      </span>
+                    ))}
+                  </div>
+                </div>
+              )}
+
               <div className="px-5 pb-4 pt-1 text-xs text-muted-foreground/60 font-mono flex items-center gap-2">
                 <span className="relative flex h-2 w-2">
                   <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-emerald-400 opacity-60" />
@@ -833,18 +988,39 @@ export default function Home() {
                         <CheckCircle className="w-3.5 h-3.5" /> Scan complete
                       </span>
                     )}
-                    {result.from_cache && (
+                    {result.mode && (
                       <span
-                        className="flex items-center gap-1 text-xs text-sky-300 bg-sky-500/10 border border-sky-500/40 rounded-full px-3 py-1"
-                        title={`Served from VIRE Atlas (cached ${result.cached_at ? new Date(result.cached_at).toLocaleString() : ""})`}
+                        className={`flex items-center gap-1 text-xs border rounded-full px-3 py-1 ${
+                          result.mode === "deep"
+                            ? "text-fuchsia-300 bg-fuchsia-500/10 border-fuchsia-500/40"
+                            : result.mode === "quick"
+                              ? "text-emerald-300 bg-emerald-500/10 border-emerald-500/40"
+                              : "text-sky-300 bg-sky-500/10 border-sky-500/40"
+                        }`}
                       >
-                        <Database className="w-3.5 h-3.5" />
-                        VIRE Atlas · {cacheAge(result.cached_at)}
-                        {typeof result.cached_hits === "number" && result.cached_hits > 1 && (
-                          <span className="opacity-70">· {result.cached_hits}× served</span>
-                        )}
+                        <Crosshair className="w-3.5 h-3.5" />
+                        Atlas {result.mode}
                       </span>
                     )}
+                    {result.from_cache && (() => {
+                      const fm = FRESHNESS_META[result.freshness ?? "stale"] ?? FRESHNESS_META.stale;
+                      return (
+                        <span
+                          className={`flex items-center gap-1.5 text-xs border rounded-full px-3 py-1 ${fm.cls}`}
+                          title={`Served from VIRE Atlas (cached ${result.cached_at ? new Date(result.cached_at).toLocaleString() : ""})`}
+                        >
+                          <span className={`relative flex h-1.5 w-1.5`}>
+                            <span className={`animate-ping absolute inline-flex h-full w-full rounded-full ${fm.dot} opacity-60`} />
+                            <span className={`relative inline-flex rounded-full h-1.5 w-1.5 ${fm.dot}`} />
+                          </span>
+                          <Database className="w-3 h-3" />
+                          {fm.label} · {cacheAge(result.cached_at)}
+                          {typeof result.cached_hits === "number" && result.cached_hits > 1 && (
+                            <span className="opacity-70">· {result.cached_hits}× served</span>
+                          )}
+                        </span>
+                      );
+                    })()}
                   </div>
                   <div className="mt-3 flex flex-wrap items-center gap-x-5 gap-y-2 text-sm text-muted-foreground">
                     <span className="flex items-center gap-1.5">
@@ -891,11 +1067,12 @@ export default function Home() {
               </div>
 
               {/* security posture */}
-              <div className="mt-6 grid grid-cols-1 sm:grid-cols-3 gap-3">
+              <div className="mt-6 grid grid-cols-2 sm:grid-cols-4 gap-3">
                 {[
                   { key: "mx", label: "Mail server (MX)", icon: Server, ok: posture.mx },
                   { key: "spf", label: "SPF Record", icon: Shield, ok: posture.spf },
                   { key: "dmarc", label: "DMARC Record", icon: Lock, ok: posture.dmarc },
+                  { key: "dkim", label: "DKIM Record", icon: MailOpen, ok: posture.dkim },
                 ].map((p) => (
                   <div
                     key={p.key}
@@ -1167,6 +1344,20 @@ export default function Home() {
                                     ? Inconclusive (SMTP)
                                   </span>
                                 )}
+                                {typeof e.confidence === "number" && e.confidence > 0 && (
+                                  <span
+                                    className={`inline-flex items-center gap-1 text-[10px] font-medium border rounded-full px-2 py-0.5 ${
+                                      e.confidence >= 90
+                                        ? "border-emerald-500/40 bg-emerald-500/15 text-emerald-300"
+                                        : e.confidence >= 70
+                                          ? "border-sky-500/40 bg-sky-500/10 text-sky-300"
+                                          : "border-zinc-500/40 bg-zinc-500/10 text-zinc-400"
+                                    }`}
+                                    title="Per-source confidence (SMTP ok = 100)"
+                                  >
+                                    {e.confidence}% conf
+                                  </span>
+                                )}
                               </div>
                             </div>
                             <Button
@@ -1411,6 +1602,35 @@ export default function Home() {
               </section>
             )}
 
+            {/* Technology Detection (deep mode) */}
+            {technologies.length > 0 && (
+              <section className="animate-fade-up rounded-2xl border border-border/70 bg-card/60 backdrop-blur-xl overflow-hidden">
+                <div className="flex items-center gap-3 px-6 py-5 border-b border-border/50">
+                  <div className="w-9 h-9 rounded-lg bg-sky-500/10 flex items-center justify-center">
+                    <Server className="w-5 h-5 text-sky-400" />
+                  </div>
+                  <div>
+                    <h3 className="font-semibold text-lg leading-tight">Technology Detection</h3>
+                    <p className="text-xs text-muted-foreground">
+                      {techStats.found ?? technologies.length} technologies · self-built fingerprinting
+                    </p>
+                  </div>
+                </div>
+                <div className="p-6 flex flex-wrap gap-2">
+                  {technologies.map((t) => (
+                    <span
+                      key={t.name}
+                      title={t.evidence}
+                      className="font-mono text-[11px] border border-sky-500/30 bg-sky-500/10 text-sky-300 rounded-full px-2.5 py-1.5 hover:border-sky-400/60 transition-all"
+                    >
+                      {t.name}
+                      <span className="text-sky-500/70 ml-1">· {t.category}</span>
+                    </span>
+                  ))}
+                </div>
+              </section>
+            )}
+
             {/* intelligence details */}
             <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
               {/* DNS */}
@@ -1493,6 +1713,18 @@ export default function Home() {
                         )}
                       </div>
                     </div>
+                    <div>
+                      <div className="text-xs text-muted-foreground mb-1.5 font-mono uppercase tracking-wide">
+                        DKIM {dkim?.selector ? `(${dkim.selector})` : ""}
+                      </div>
+                      <div className="rounded-lg bg-black/30 border border-border/50 px-3.5 py-2.5 font-mono text-xs break-all">
+                        {dkim?.record ? (
+                          <span className="text-emerald-400">{dkim.record}</span>
+                        ) : (
+                          <span className="text-muted-foreground/40">— not found —</span>
+                        )}
+                      </div>
+                    </div>
                     {securityTxt.found && (
                       <div>
                         <div className="text-xs text-muted-foreground mb-1.5 font-mono uppercase tracking-wide">security.txt</div>
@@ -1526,6 +1758,9 @@ export default function Home() {
                       { label: "GitHub contacts", value: githubStats.emails_found ?? 0 },
                       { label: "List emails", value: mailingStats.emails_found ?? 0 },
                       { label: "Career emails", value: careerStats.emails_found ?? 0 },
+                      { label: "Job portal emails", value: jobportalStats.emails_found ?? 0 },
+                      { label: "CT subdomains", value: ctStats.names_found ?? 0 },
+                      { label: "Technologies", value: techStats.found ?? technologies.length },
                     ].map((s) => (
                       <div key={s.label} className="rounded-xl border border-border/50 bg-black/30 px-3 py-4 hover:border-primary/40 transition-colors">
                         <div className="text-2xl font-black text-primary">{s.value}</div>

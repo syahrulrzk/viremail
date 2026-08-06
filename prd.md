@@ -1,5 +1,5 @@
 # PRD — OSINTMail
-Version: 1.2 (MVP — fokus Email Discovery + Deep Search)
+Version: 1.4 (MVP — Email Discovery + Deep Search + HRD Hunter + Atlas Knowledge Graph)
 
 ## 1. Overview
 
@@ -56,6 +56,9 @@ Output (sudah diimplementasikan):
 - **Subdomain enumeration (v1.2)**: DNS brute-force ~60 nama umum (concurrent), host aktif di-crawl (max 5)
 - **WHOIS lookup (v1.2)**: registrar, tanggal, name servers, email kontak (public whois protocol, tanpa API)
 - **Deep OSINT tools (v1.3, mode opsional)**: checkbox "Deep OSINT" di frontend → jalanin **BBOT** (email-enum preset: subdomain + email via crt/pgp/securitytxt/sslcert dll, self-hosted, `--no-deps`; max 15 email di-merge) & **Holehe** (cek jejak akun email di ~120 platform). Tanpa API key. Scan deep bisa 3-5 menit. Catatan: run BBOT pertama kali mendownload wordlist ke `~/.bbot` (bisa bikin scan pertama lebih lama).
+- **Job Portal HRD emails (v1.4)**: source baru `jobportal` di dalam scan domain — discovery listing via search-engine dork (`site:karir.com …`), fetch listing dengan polite scraping (rate-limit per host + jitter, rotasi User-Agent, hormati robots.txt, cap request per host), **LinkedIn sengaja tidak di-fetch langsung** (anti-bot brutal — hanya diambil jika muncul di hasil search engine). Email HRD/recruitment (hr@, recruitment@, people@, dsb) ditandai otomatis. Aman tanpa banned.
+- **Parallel scan engine (v1.4)**: web crawl (fetch paralel + keep-alive session), search engine DDG + Bing barengan, Wayback snapshots, dokumen publik, crawl subdomain, dan SMTP probe (pool kecil dengan shared budget) semuanya berjalan konkuren → waktu scan per domain turun drastis.
+- **VIRE Atlas knowledge graph (v1.4)**: hasil scan tidak lagi disimpan sebagai 1 blob JSON — dipecah menjadi knowledge model ternormalisasi (`atlas_domains`, `atlas_emails`, `atlas_sources`, `atlas_relationships`, dll, 12 tabel). Konsep **Scan** (proses: job/progress/status) dipisah dari **Atlas** (intelligence: hasil yang sudah dinormalisasi & di-cache). Setiap entity punya lifecycle sendiri (first_seen/last_seen), update independen, dan siap untuk graph visualization.
 - Referensi search engine publik — **multi-query (v1.2)**: Bing (RSS) & DuckDuckGo (HTML POST), 3-4 variasi dork per engine
 - Google dorking manual — query siap-pakai (`site:"@domain" email`, dll) yang dibuka di browser user sendiri; Google memblokir scraping otomatis, jadi dork dijalankan manual
 - Verifikasi SMTP per email (RCPT TO probe ke mail server — tanpa mengirim email): status **aktif / tidak ada / tak tentu**, plus deteksi mail server catch-all, sender netral (noreply@example.org), budget waktu 45 detik/scan
@@ -88,8 +91,12 @@ Belum diimplementasikan (roadmap):
 
 ### Search Endpoints
 
-POST /api/v1/search/domain  ✅ Aktif — email discovery & domain intelligence
-                            (body: {"domain": "example.com"})
+POST /api/v1/search/domain      ✅ Aktif — email discovery & domain intelligence
+                                (body: {"domain": "example.com", "mode": "quick|smart|deep", "force": false})
+
+POST /api/v1/search/jobportal   ✅ Aktif (v1.4) — HRD Hunter bulk: keyword + lokasi →
+                                email HRD dari banyak company via job portal
+                                (body: {"keyword": "software engineer", "location": "jakarta", "max_pages": 20})
 
 🗑️ POST /api/v1/search/email      — dihapus di v1.1 (sebelumnya stub data palsu)
 🗑️ POST /api/v1/search/username   — dihapus di v1.1 (sebelumnya stub data palsu)
@@ -201,23 +208,26 @@ Keamanan: semua request HTTP memakai SSRF guard — host private/loopback/cloud-
 
 ## 10. Database
 
-Tables
+Struktur model dipecah per domain (v1.4):
 
-- users
-- api_keys
-- webhooks
-- scans
-- scan_results
-- domains
-- emails
-- usernames
-- dns_records
-- certificates
-- technologies
-- workers
-- audit_logs
-- api_key_usage
-- notifications
+```
+models/
+├── auth/      user, organization, team (+team_members), api_key, audit_log, webhook, notification, api_key_usage
+├── scan/      scan, scan_job, scan_task, scan_progress, scan_result
+├── worker/    worker, worker_job, worker_queue, worker_log
+├── atlas/     🧠 Knowledge Graph (12 tabel):
+│              atlas_domains, atlas_emails, atlas_sources, atlas_relationships,
+│              atlas_subdomains, atlas_dns_records, atlas_certificates,
+│              atlas_documents, atlas_persons, atlas_usernames,
+│              atlas_technologies, atlas_histories
+└── source.py  registry connector (17 source di-seed: website, mailto, careers,
+               jobportal, github, wayback, ocr, smtp, …)
+```
+
+Tabel lama (scaffold yang tidak terpakai: `domains`, `emails`, `usernames`,
+`dns_records`, `certificates`, `technologies`, `scan`, `worker`, dan blob
+`vire_atlas`) di-drop di migration `b7c9d1e2f3a4`; data cache `vire_atlas`
+lama di-migrate ke `atlas_domains` + `atlas_histories`.
 
 ## 11. Security
 
@@ -242,6 +252,13 @@ Tables
 - WebSocket live updates
 
 ## 13. Roadmap
+
+### Phase 0.5 ✅ COMPLETED (v1.4)
+- ✅ Job Portal HRD hunting (polite scraping, tanpa banned)
+- ✅ HRD Hunter bulk endpoint
+- ✅ Parallel scan engine (percepatan scan per domain)
+- ✅ Restructure Atlas → Knowledge Model (auth/ scan/ worker/ atlas/ + source registry)
+- ✅ Cache & lookup hasil scan via Atlas history (bukan blob JSON)
 
 ### Phase 1 ✅ COMPLETED (dirapikan di v1.1)
 - ✅ Authentication (API endpoints structure)
@@ -326,6 +343,11 @@ Tables
 - ✅ Search engine multi-query — selesai di v1.2
 - ✅ Deep crawl BFS depth-2 — selesai di v1.2
 - ✅ Deep OSINT tools: BBOT + Holehe (mode opsional) — selesai di v1.3
+- ✅ Job Portal HRD emails (source `jobportal`, polite scraping, ban-averse) — selesai di v1.4
+- ✅ HRD Hunter bulk endpoint `POST /search/jobportal` (keyword + lokasi) — selesai di v1.4
+- ✅ Parallel scan engine (crawl/search/wayback/docs/subdomain/SMTP konkuren) — selesai di v1.4
+- ✅ VIRE Atlas knowledge graph (12 tabel, scan⇄atlas dipisah, `atlas_service.py`) — selesai di v1.4
+- ✅ Mode scan (`quick|smart|deep`) diterima API & dipakai engine (v1.4)
 
 ## 14. Success Metrics
 

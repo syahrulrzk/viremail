@@ -14,6 +14,7 @@ interface EmailResult {
   verified: boolean;
   smtp?: "ok" | "rejected" | "unknown" | "unchecked";
   url?: string;
+  confidence?: number;
 }
 
 interface Person {
@@ -31,6 +32,8 @@ interface ExportResult {
   task_id?: string;
   message?: string;
   error?: string;
+  mode?: string;
+  freshness?: string;
   results?: {
     emails: EmailResult[];
     email_stats: {
@@ -51,8 +54,12 @@ interface ExportResult {
     dns_records: Record<string, string[]>;
     spf: string | null;
     dmarc: string | null;
-    security_posture: { mx: boolean; spf: boolean; dmarc: boolean };
+    dkim?: { selector?: string; record?: string } | null;
+    security_posture: { mx: boolean; spf: boolean; dmarc: boolean; dkim?: boolean };
     security_txt: { found: boolean; contacts: string[] };
+    ct_stats?: { requests?: number; certs_found?: number; names_found?: number; message?: string; skipped?: boolean };
+    technologies?: { name: string; category: string; evidence: string }[];
+    tech_stats?: { scanned?: boolean; found?: number; message?: string; skipped?: boolean };
     crawl_stats: { pages_crawled: number; links_found: number; max_depth?: number };
     doc_stats: { docs_found?: number; docs_parsed?: number; emails_found?: number };
     ocr_stats?: {
@@ -102,6 +109,7 @@ const SOURCE_LABELS: Record<string, string> = {
   website: "Website",
   mailto: "mailto",
   careers: "Careers",
+  jobportal: "Job Portal",
   github: "GitHub",
   mailing_list: "Mailing List",
   security_txt: "security.txt",
@@ -216,6 +224,8 @@ export function exportToExcel(result: ExportResult) {
   stats.push(["Domain", result.domain]);
   stats.push(["Scan Date", nowHuman()]);
   stats.push(["Status", result.status === "completed" ? "Completed" : result.status]);
+  if (result.mode) stats.push(["Scan Mode", `Atlas ${result.mode}`]);
+  if (result.freshness) stats.push(["Atlas Freshness", result.freshness]);
   if (r) stats.push(["Duration", `${((r.timings?.total ?? result.duration_ms ?? 0) / 1000).toFixed(1)}s`]);
   stats.push(["Confidence Score", r ? `${r.confidence_score}/100` : "—"]);
   stats.push([]);
@@ -279,17 +289,18 @@ export function exportToExcel(result: ExportResult) {
 
   /* ---- Sheet 2: Emails ---- */
   const wsEmails = XLSX.utils.aoa_to_sheet([
-    ["Email", "Source", "Verified", "SMTP Status", "Source URL"],
+    ["Email", "Source", "Verified", "SMTP Status", "Confidence", "Source URL"],
     ...(r?.emails ?? []).map((e) => [
       e.email,
       sourceLabel(e.source),
       e.verified ? "Yes" : "No",
       smtpLabel(e.smtp),
+      e.confidence ? `${e.confidence}%` : "—",
       e.url ?? "",
     ]),
   ]);
-  setWidths(wsEmails, [38, 18, 10, 24, 60]);
-  styleHeaderRow(wsEmails, 5);
+  setWidths(wsEmails, [38, 18, 10, 24, 12, 60]);
+  styleHeaderRow(wsEmails, 6);
   if ((r?.emails?.length ?? 0) > 0) {
     // Color the SMTP status column
     for (let rr = 1; rr <= (r?.emails?.length ?? 0); rr++) {
@@ -353,7 +364,19 @@ export function exportToExcel(result: ExportResult) {
     XLSX.utils.book_append_sheet(wb, wsWhois, "WHOIS");
   }
 
-  /* ---- Sheet 7: Deep OSINT (Holehe) ---- */
+  /* ---- Sheet 7: Technologies ---- */
+  if (r?.technologies?.length) {
+    const techRows = [
+      ["Technology", "Category", "Evidence"],
+      ...r.technologies.map((t) => [t.name, t.category, t.evidence]),
+    ];
+    const wsTech = XLSX.utils.aoa_to_sheet(techRows);
+    setWidths(wsTech, [28, 16, 60]);
+    styleHeaderRow(wsTech, 3);
+    XLSX.utils.book_append_sheet(wb, wsTech, "Technologies");
+  }
+
+  /* ---- Sheet 8: Deep OSINT (Holehe) ---- */
   const holehe = r?.deep_osint?.holehe?.results;
   if (holehe && Object.keys(holehe).length > 0) {
     const holeRows = [
