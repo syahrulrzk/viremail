@@ -10,32 +10,19 @@
 
 set -euo pipefail
 
-TAG="${1:-latest}"
-COMPOSE_FILE="docker-compose.prod.yml"
-REPO="${GITHUB_REPOSITORY:-}"
-
-echo "🚀 Deploying VIRE with image tag: ${TAG}"
-
-# Require GITHUB_REPOSITORY for proper image resolution
-if [ -z "$REPO" ]; then
-    echo "❌ Set GITHUB_REPOSITORY env var first, e.g.:"
-    echo "   export GITHUB_REPOSITORY=your-org/vire"
-    exit 1
-fi
-
-export IMAGE_TAG="$TAG"
+echo "🚀 Deploying VIRE..."
 
 echo "📦 Pulling images..."
-docker compose -f "$COMPOSE_FILE" pull
+docker compose pull
 
 echo "🔄 Restarting services..."
-docker compose -f "$COMPOSE_FILE" up -d --force-recreate
+docker compose up -d --force-recreate
 
 echo ""
 echo "✅ Deployed successfully!"
 echo ""
 echo "📊 Service status:"
-docker compose -f "$COMPOSE_FILE" ps
+docker compose ps
 echo ""
 echo "💡 To check logs:"
-echo "   docker compose -f $COMPOSE_FILE logs -f"
+echo "   docker compose logs -f"
