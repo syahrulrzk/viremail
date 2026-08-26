@@ -1,5 +1,11 @@
 version: '3.8'
 
+# Production docker-compose — pulls pre-built images from GHCR.
+# Usage:
+#   export IMAGE_TAG=main       # or a commit SHA / release tag
+#   docker compose -f docker-compose.prod.yml pull
+#   docker compose -f docker-compose.prod.yml up -d
+
 services:
   postgres:
     image: postgres:16-alpine
@@ -12,6 +18,7 @@ services:
       - "5432:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
+    restart: unless-stopped
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-osintmail}"]
       interval: 10s
@@ -25,6 +32,7 @@ services:
       - "6379:6379"
     volumes:
       - redis_data:/data
+    restart: unless-stopped
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 10s
@@ -32,9 +40,7 @@ services:
       retries: 5
 
   backend:
-    build:
-      context: ./backend
-      target: api
+    image: ghcr.io/${GITHUB_REPOSITORY:-your-org/vire}/backend:${IMAGE_TAG:-latest}
     container_name: vire-backend
     env_file:
       - .env
@@ -48,11 +54,10 @@ services:
     environment:
       - POSTGRES_SERVER=postgres
       - REDIS_HOST=redis
+    restart: unless-stopped
 
   worker:
-    build:
-      context: ./backend
-      target: worker
+    image: ghcr.io/${GITHUB_REPOSITORY:-your-org/vire}/worker:${IMAGE_TAG:-latest}
     container_name: vire-worker
     env_file:
       - .env
@@ -64,19 +69,20 @@ services:
     environment:
       - POSTGRES_SERVER=postgres
       - REDIS_HOST=redis
+    restart: unless-stopped
     deploy:
-      replicas: 2
+      replicas: ${WORKER_REPLICAS:-3}
 
   frontend:
-    build:
-      context: ./frontend
+    image: ghcr.io/${GITHUB_REPOSITORY:-your-org/vire}/frontend:${IMAGE_TAG:-latest}
     container_name: vire-frontend
     ports:
       - "3000:3000"
     depends_on:
       - backend
     environment:
-      - NEXT_PUBLIC_API_URL=http://localhost:8000
+      - NEXT_PUBLIC_API_URL=${NEXT_PUBLIC_API_URL:-http://localhost:8000}
+    restart: unless-stopped
 
 volumes:
   postgres_data:

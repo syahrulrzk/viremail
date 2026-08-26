@@ -1,0 +1,10 @@
+node_modules
+.next
+out
+.git
+.gitignore
+*.log
+npm-debug.log*
+README.md
+AGENTS.md
+CLAUDE.md
