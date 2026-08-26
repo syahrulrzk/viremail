@@ -52,6 +52,8 @@ services:
     environment:
       - POSTGRES_SERVER=postgres
       - REDIS_HOST=redis
+      - REDIS_URL=redis://redis:6379/0
+      - DATABASE_URL=postgresql://osintmail:osintmail123@postgres:5432/osintmail
     restart: unless-stopped
 
   worker:
@@ -66,9 +68,11 @@ services:
     environment:
       - POSTGRES_SERVER=postgres
       - REDIS_HOST=redis
+      - REDIS_URL=redis://redis:6379/0
+      - DATABASE_URL=postgresql://osintmail:osintmail123@postgres:5432/osintmail
     restart: unless-stopped
     deploy:
-      replicas: ${WORKER_REPLICAS:-3}
+      replicas: ${WORKER_REPLICAS:-1}
 
   frontend:
     image: ghcr.io/${GITHUB_REPOSITORY:-your-org/vire}/frontend:${IMAGE_TAG:-latest}

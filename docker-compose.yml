@@ -44,6 +44,8 @@ services:
     environment:
       - POSTGRES_SERVER=postgres
       - REDIS_HOST=redis
+      - REDIS_URL=redis://redis:6379/0
+      - DATABASE_URL=postgresql://osintmail:osintmail123@postgres:5432/osintmail
     restart: unless-stopped
 
   worker:
@@ -58,6 +60,8 @@ services:
     environment:
       - POSTGRES_SERVER=postgres
       - REDIS_HOST=redis
+      - REDIS_URL=redis://redis:6379/0
+      - DATABASE_URL=postgresql://osintmail:osintmail123@postgres:5432/osintmail
     restart: unless-stopped
     deploy:
       replicas: 1
