@@ -1,5 +1,3 @@
-version: '3.8'
-
 # Production docker-compose — pulls pre-built images from GHCR.
 # Usage:
 #   export IMAGE_TAG=main       # or a commit SHA / release tag
@@ -58,7 +56,6 @@ services:
 
   worker:
     image: ghcr.io/${GITHUB_REPOSITORY:-your-org/vire}/worker:${IMAGE_TAG:-latest}
-    container_name: vire-worker
     env_file:
       - .env
     depends_on:
