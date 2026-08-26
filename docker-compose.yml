@@ -60,7 +60,7 @@ services:
       - REDIS_HOST=redis
     restart: unless-stopped
     deploy:
-      replicas: 3
+      replicas: 1
 
   frontend:
     image: ghcr.io/syahrulrzk/viremail/frontend:latest
